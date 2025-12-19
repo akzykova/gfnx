@@ -169,10 +169,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         env, traj_data, env_params
     )
     rl_reward = log_pb_traj + aux_info["log_gfn_reward"] + aux_info["entropy"]
-
-    # Step 2. Compute the loss
-    # loss_fn now takes combined parameters (model_params and logZ)
-    # It also needs static parts of the model to reconstruct it.
+    
     def loss_fn(
         current_all_params: dict,
         static_model_parts: MLPPolicy,
@@ -182,6 +179,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     ):
         # Extract model's learnable parameters and logZ from the input
         model_learnable_params = current_all_params["model_params"]
+        logZ_val = current_all_params["logZ"]
 
         # Reconstruct the callable model using its learnable parameters
         model_to_call = eqx.combine(model_learnable_params, static_model_parts)
@@ -209,13 +207,48 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         fwd_logprobs_traj = jnp.where(current_traj_data.pad, 0.0, fwd_logprobs_traj)
         sum_log_pf_along_traj = fwd_logprobs_traj.sum(axis=1)
 
-        non_pad_mask = ~current_traj_data.pad
-        last_non_pad_idx = jnp.sum(non_pad_mask, axis=1) - 1
-        batch_indices = jnp.arange(current_traj_data.obs.shape[0])
-        terminal_rewards = jnp.exp(current_traj_data.log_gfn_reward[batch_indices, last_non_pad_idx])
 
-        loss = -jnp.mean(sum_log_pf_along_traj * terminal_rewards)
-        return loss
+        prev_states = jax.tree.map(lambda x: x[:, :-1], current_traj_data.state)
+        fwd_actions = current_traj_data.action[:, :-1]
+        curr_states = jax.tree.map(lambda x: x[:, 1:], current_traj_data.state)
+
+        bwd_actions_traj = jax.vmap(
+            current_env.get_backward_action,
+            in_axes=(1, 1, 1, None),
+            out_axes=1,
+        )(prev_states, fwd_actions, curr_states, current_env_params)
+
+        bwd_logits_traj = policy_outputs_traj["backward_logits"]
+        bwd_logits_for_pb = bwd_logits_traj[:, 1:]
+        # Vmap get_bwd_masks_per_step over the time dimension.
+        invalid_bwd_mask = jax.vmap(
+            current_env.get_invalid_backward_mask,
+            in_axes=(1, None),
+            out_axes=1,
+        )(curr_states, current_env_params)
+
+        masked_bwd_logits_traj = gfnx.utils.mask_logits(bwd_logits_for_pb, invalid_bwd_mask)
+        bwd_all_log_probs_traj = jax.nn.log_softmax(masked_bwd_logits_traj, axis=-1)
+
+        log_pb_selected = jnp.take_along_axis(
+            bwd_all_log_probs_traj,
+            jnp.expand_dims(bwd_actions_traj, axis=-1),
+            axis=-1,
+        ).squeeze(-1)
+
+        pad_mask_for_bwd = current_traj_data.pad[:, :-1]
+        log_pb_selected = jnp.where(pad_mask_for_bwd, 0.0, log_pb_selected)
+
+        log_rewards_at_steps = current_traj_data.log_gfn_reward[:, :-1]
+        masked_log_rewards_at_steps = jnp.where(pad_mask_for_bwd, 0.0, log_rewards_at_steps)
+
+        log_pb_plus_rewards_along_traj = log_pb_selected + masked_log_rewards_at_steps
+        reward = jnp.sum(log_pb_plus_rewards_along_traj, axis=1)
+
+        # loss = optax.losses.squared_error(log_pf_traj, target).mean()
+        loss = -jnp.mean(sum_log_pf_along_traj * (reward - logZ_val))
+        entropy = -jnp.mean(sum_log_pf_along_traj)
+        return loss + entropy
 
     # Prepare parameters for the loss function and gradient calculation
     # policy_params are model network parameters
