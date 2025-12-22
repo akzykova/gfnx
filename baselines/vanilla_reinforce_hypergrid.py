@@ -35,6 +35,8 @@ from gfnx.metrics import (
     MultiMetricsState,
 )
 
+from jax.lax import stop_gradient
+
 
 from utils.logger import Writer
 from utils.checkpoint import save_checkpoint
@@ -245,10 +247,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         log_pb_plus_rewards_along_traj = log_pb_selected + masked_log_rewards_at_steps
         reward = jnp.sum(log_pb_plus_rewards_along_traj, axis=1)
 
-        # loss = optax.losses.squared_error(log_pf_traj, target).mean()
-        loss = -jnp.mean(sum_log_pf_along_traj * (reward - logZ_val))
-        entropy = -jnp.mean(sum_log_pf_along_traj)
-        return loss + entropy
+        return -jnp.mean(sum_log_pf_along_traj * (reward - stop_gradient(sum_log_pf_along_traj)))
 
     # Prepare parameters for the loss function and gradient calculation
     # policy_params are model network parameters

@@ -211,7 +211,7 @@ class ExactDistributionMetricsModule(BaseMetricsModule):
         num_states = transition.shape[0] // 2
 
         initial_vector = jnp.zeros((2 * num_states,))
-        initial_state = jax.tree_map(lambda x: x[0], self.env.get_init_state(1))
+        initial_state = jax.tree.map(lambda x: x[0], self.env.get_init_state(1))
         initial_idx = self.env.state_to_index(initial_state, args.env_params)
         initial_vector = initial_vector.at[initial_idx].set(1.0)
 
@@ -248,7 +248,7 @@ class ExactDistributionMetricsModule(BaseMetricsModule):
         remainder = num_states % self.batch_size
         if remainder != 0:
             pad_width = self.batch_size - remainder
-            padded_sorted_states = jax.tree_map(
+            padded_sorted_states = jax.tree.map(
                 lambda x: jnp.pad(
                     x, ((0, pad_width),) + ((0, 0),) * (x.ndim - 1), mode="constant"
                 ),
