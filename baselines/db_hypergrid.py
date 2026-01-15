@@ -25,8 +25,19 @@ import optax
 from jax_tqdm import loop_tqdm
 from omegaconf import OmegaConf
 
+import io
+import matplotlib.pyplot as plt
+from PIL.Image import fromarray as pil_fromarray, open as pil_open
+
 import gfnx
-from gfnx.metrics import ApproxDistributionMetricsModule, ApproxDistributionMetricsState
+from gfnx.metrics import (
+    ApproxDistributionMetricsModule,
+    ELBOMetricsModule,
+    EUBOMetricsModule,
+    ExactDistributionMetricsModule,
+    MultiMetricsModule,
+    MultiMetricsState,
+)
 
 from utils.logger import Writer
 from utils.checkpoint import save_checkpoint
@@ -112,8 +123,8 @@ class TrainState(NamedTuple):
     model: MLPPolicy
     optimizer: optax.GradientTransformation
     opt_state: optax.OptState
-    metrics_module: ApproxDistributionMetricsModule
-    metrics_state: ApproxDistributionMetricsState
+    metrics_module: MultiMetricsModule
+    metrics_state: MultiMetricsState
     exploration_schedule: optax.Schedule
     eval_info: dict
 
@@ -215,10 +226,25 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     )
     model = eqx.apply_updates(train_state.model, updates)
     # Perform all the required logging
+    # metrics_state = metrics_module.update(
+    #     train_state.metrics_state,
+    #     rng_key=jax.random.key(0),  # This key is not used in the update method
+    #     args=metrics_module.UpdateArgs(states=log_info["final_env_state"]),
+    # )
+
     metrics_state = metrics_module.update(
         train_state.metrics_state,
         rng_key=jax.random.key(0),  # This key is not used in the update method
-        args=metrics_module.UpdateArgs(states=log_info["final_env_state"]),
+        args=metrics_module.UpdateArgs(
+            metrics_args={
+                "approx_dist": ApproxDistributionMetricsModule.UpdateArgs(
+                    states=log_info["final_env_state"]
+                ),
+                "exact_dist": ExactDistributionMetricsModule.UpdateArgs(),
+                "elbo": ELBOMetricsModule.UpdateArgs(),
+                "eubo": EUBOMetricsModule.UpdateArgs(),
+            }
+        ),
     )
 
     # Perform evaluation computations if needed
@@ -232,9 +258,26 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         {
             "metrics_state": metrics_state,
             "rng_key": jax.random.key(0),  # This key is not used in the process method
-            "args": metrics_module.ProcessArgs(env_params=env_params),
+            "args": metrics_module.ProcessArgs(
+                metrics_args={
+                    "approx_dist": ApproxDistributionMetricsModule.ProcessArgs(
+                        env_params=env_params
+                    ),
+                    "exact_dist": ExactDistributionMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=train_state.env_params
+                    ),
+                    "elbo": ELBOMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=train_state.env_params
+                    ),
+                    "eubo": EUBOMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=train_state.env_params
+                    ),
+                }
+            ),
         },
     )
+
+    
     eval_info = jax.lax.cond(
         is_eval_step,
         lambda metrics_state: metrics_module.get(metrics_state),
@@ -254,25 +297,38 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             log.info(f"Step {idx}")
             log.info(train_info)
             # Get the evaluation metrics
-            eval_info = {f"eval/{key}": value for key, value in eval_info.items()}
-
-            log.info({
-                key: float(value)
+            eval_info_for_log = {
+                f"eval/{key}": float(value)
                 for key, value in eval_info.items()
-                if key not in ["eval/2d_marginal_distribution"]
+                if "2d_marginal_distribution" not in key
+            }
+            log.info({
+                key: value
+                for key, value in eval_info_for_log.items()
+                if "2d_marginal_distribution" not in key
             })
             if cfg.logging.use_writer:
-                marginal_dist = eval_info["eval/2d_marginal_distribution"]
+                marginal_dist = eval_info["approx_dist/2d_marginal_distribution"]
                 marginal_dist = (marginal_dist - marginal_dist.min()) / (
                     marginal_dist.max() - marginal_dist.min()
                 )
-                eval_info["eval/2d_marginal_distribution"] = writer.Image(
-                    np.array(
-                        255.0 * marginal_dist,
-                        dtype=np.int32,
-                    )
+
+                plt.figure(figsize=(6, 5))
+                im = plt.imshow(marginal_dist, cmap='viridis', interpolation='nearest')
+                plt.colorbar(im)
+                plt.title(f"2D Marginal Distribution (Step {idx})")
+                
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+                plt.close()
+                buf.seek(0)
+                pil_img = pil_open(buf)
+
+                writer.Image(
+                    pil_img,
+                    caption="approx_dist/marginal_dist",
                 )
-                writer.log(eval_info, commit=False)
+                writer.log(eval_info_for_log, step=idx, commit=False)
 
         if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
             writer.log(train_info)
@@ -349,16 +405,78 @@ def run_experiment(cfg: OmegaConf) -> None:
     optimizer = optax.adam(learning_rate=cfg.agent.learning_rate)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    metrics_module = ApproxDistributionMetricsModule(
-        metrics=["tv", "kl", "2d_marginal_distribution"],
-        env=env,
-        buffer_size=cfg.logging.metric_buffer_size,
-    )
+    # metrics_module = ApproxDistributionMetricsModule(
+    #     metrics=["tv", "kl", "2d_marginal_distribution"],
+    #     env=env,
+    #     buffer_size=cfg.logging.metric_buffer_size,
+    # )
+
+    policy_static = eqx.filter(model, eqx.is_array, inverse=True)
+
+    def fwd_policy_fn(
+        rng_key: chex.PRNGKey, env_obs: gfnx.TObs, current_policy_params
+    ) -> chex.Array:
+        del rng_key
+        # Recombine the network parameters with the static parts of the model
+        current_model = eqx.combine(current_policy_params, policy_static)
+        policy_outputs = jax.vmap(current_model, in_axes=(0,))(env_obs)
+        return policy_outputs["forward_logits"], policy_outputs
+
+    def bwd_policy_fn(
+        rng_key: chex.PRNGKey, env_obs: gfnx.TObs, current_policy_params
+    ) -> chex.Array:
+        del rng_key
+        current_model = eqx.combine(current_policy_params, policy_static)
+        policy_outputs = jax.vmap(current_model, in_axes=(0,))(env_obs)
+        return policy_outputs["backward_logits"], policy_outputs
+
+    metrics_module = MultiMetricsModule({
+        "approx_dist": ApproxDistributionMetricsModule(
+            metrics=["tv", "kl", "2d_marginal_distribution"],
+            env=env,
+            buffer_size=cfg.logging.metric_buffer_size,
+        ),
+        "exact_dist": ExactDistributionMetricsModule(
+            metrics=["tv", "kl", "2d_marginal_distribution"],
+            env=env,
+            fwd_policy_fn=fwd_policy_fn,
+            batch_size=cfg.metrics.batch_size,
+        ),
+        "elbo": ELBOMetricsModule(
+            env=env,
+            env_params=env_params,
+            fwd_policy_fn=fwd_policy_fn,
+            n_rounds=cfg.metrics.n_rounds,
+            batch_size=cfg.num_envs,
+        ),
+        "eubo": EUBOMetricsModule(
+            env=env,
+            env_params=env_params,
+            bwd_policy_fn=bwd_policy_fn,
+            n_rounds=cfg.metrics.n_rounds,
+            batch_size=cfg.num_envs,
+            rng_key=eval_init_key,
+        ),
+    })
+
     # Initialize the metrics state
     eval_init_key, new_eval_init_key = jax.random.split(eval_init_key)
+    # metrics_state = metrics_module.init(
+    #     new_eval_init_key, metrics_module.InitArgs(env_params=env_params)
+    # )
+
     metrics_state = metrics_module.init(
-        new_eval_init_key, metrics_module.InitArgs(env_params=env_params)
+        eval_init_key,
+        metrics_module.InitArgs(
+            metrics_args={
+                "approx_dist": ApproxDistributionMetricsModule.InitArgs(env_params=env_params),
+                "exact_dist": ExactDistributionMetricsModule.InitArgs(env_params=env_params),
+                "elbo": ELBOMetricsModule.InitArgs(),
+                "eubo": EUBOMetricsModule.InitArgs(),
+            }
+        ),
     )
+
     eval_info = metrics_module.get(metrics_state)
 
     train_state = TrainState(

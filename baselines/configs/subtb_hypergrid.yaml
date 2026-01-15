@@ -24,12 +24,16 @@ environment:
   dim: 2
   side: 5
 
+metrics:
+  n_rounds : 10
+  batch_size: 1024
+
 logging:
   track_each: 1 # in terms of total training steps, not divided by num_envs
   eval_each: 100 # in terms of total training steps, not divided by num_envs
   metric_buffer_size: 200000
   tqdm_print_rate: 20
-  use_writer: true
+  use_writer: false
   log_dir: null # If null, dir will be automatically created
   checkpoint_dir: null # If null, dir will be automatically created
 

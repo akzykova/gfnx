@@ -41,6 +41,8 @@ from jax.lax import stop_gradient
 from utils.logger import Writer
 from utils.checkpoint import save_checkpoint
 
+import matplotlib.pyplot as plt
+
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 writer = Writer()
@@ -244,10 +246,17 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         log_rewards_at_steps = current_traj_data.log_gfn_reward[:, :-1]
         masked_log_rewards_at_steps = jnp.where(pad_mask_for_bwd, 0.0, log_rewards_at_steps)
 
-        log_pb_plus_rewards_along_traj = log_pb_selected + masked_log_rewards_at_steps
-        reward = jnp.sum(log_pb_plus_rewards_along_traj, axis=1)
+        def reverse_cumsum(x, axis=1):
+            reversed_x = jnp.flip(x, axis=axis)
+            cumsum_rev = jnp.cumsum(reversed_x, axis=axis)
+            return jnp.flip(cumsum_rev, axis=axis)
+        
+        reward_cumsum = reverse_cumsum(masked_log_rewards_at_steps) + reverse_cumsum(log_pb_selected)
+        p_forward_cumsum = reverse_cumsum(fwd_logprobs_traj[:, :-1])
 
-        return -jnp.mean(sum_log_pf_along_traj * (reward - stop_gradient(sum_log_pf_along_traj)))
+        loss_per_traj = jnp.sum(fwd_logprobs_traj[:, :-1] * (reward_cumsum - stop_gradient(p_forward_cumsum)), axis = 1)
+
+        return -jnp.mean(loss_per_traj)
 
     # Prepare parameters for the loss function and gradient calculation
     # policy_params are model network parameters
@@ -393,7 +402,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     )
 
 
-@hydra.main(config_path="configs/", config_name="tb_hypergrid", version_base=None)
+@hydra.main(config_path="configs/", config_name="reinforce_hypergrid", version_base=None)
 def run_experiment(cfg: OmegaConf) -> None:
     # Log the configuration
     log.info(OmegaConf.to_yaml(cfg))
@@ -591,7 +600,6 @@ def run_experiment(cfg: OmegaConf) -> None:
             "logZ": final_train_state.logZ,
         },
     )
-
 
 if __name__ == "__main__":
     run_experiment()

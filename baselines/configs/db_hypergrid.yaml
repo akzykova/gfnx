@@ -22,6 +22,10 @@ environment:
   dim: 4
   side: 20
 
+metrics:
+  n_rounds : 10
+  batch_size: 1024
+
 logging:
   track_each: 1 # in terms of total training steps, not divided by num_envs
   eval_each: 500 # in terms of total training steps, not divided by num_envs

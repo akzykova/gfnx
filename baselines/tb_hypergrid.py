@@ -25,6 +25,10 @@ import optax
 from jax_tqdm import loop_tqdm
 from omegaconf import OmegaConf
 
+import io
+import matplotlib.pyplot as plt
+from PIL.Image import fromarray as pil_fromarray, open as pil_open
+
 import gfnx
 from gfnx.metrics import (
     ApproxDistributionMetricsModule,
@@ -343,28 +347,38 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             log.info(f"Step {idx}")
             log.info(train_info)
             # Get the evaluation metrics
-            eval_info = {
+            eval_info_for_log = {
                 f"eval/{key}": float(value)
                 for key, value in eval_info.items()
                 if "2d_marginal_distribution" not in key
             }
             log.info({
                 key: value
-                for key, value in eval_info.items()
+                for key, value in eval_info_for_log.items()
                 if "2d_marginal_distribution" not in key
             })
             if cfg.logging.use_writer:
-                marginal_dist = eval_info["eval/2d_marginal_distribution"]
+                marginal_dist = eval_info["approx_dist/2d_marginal_distribution"]
                 marginal_dist = (marginal_dist - marginal_dist.min()) / (
                     marginal_dist.max() - marginal_dist.min()
                 )
-                eval_info["eval/2d_marginal_distribution"] = writer.Image(
-                    np.array(
-                        255.0 * marginal_dist,
-                        dtype=np.int32,
-                    )
+
+                plt.figure(figsize=(6, 5))
+                im = plt.imshow(marginal_dist, cmap='viridis', interpolation='nearest')
+                plt.colorbar(im)
+                plt.title(f"2D Marginal Distribution (Step {idx})")
+                
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+                plt.close()
+                buf.seek(0)
+                pil_img = pil_open(buf)
+
+                writer.Image(
+                    pil_img,
+                    caption="approx_dist/marginal_dist",
                 )
-                writer.log(eval_info, commit=False)
+                writer.log(eval_info_for_log, step=idx, commit=False)
 
         if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
             writer.log(train_info)

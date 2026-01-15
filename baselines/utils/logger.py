@@ -3,11 +3,11 @@ import json
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import io
 import numpy as np
 import jax.numpy as jnp
 from PIL.Image import Image as PILImage
 from PIL.Image import fromarray as pil_fromarray, open as pil_open
-
 
 class BaseLoggerWrapper(ABC):
     """Abstract base class for logger wrappers."""
@@ -92,12 +92,72 @@ class WandBWrapper(BaseLoggerWrapper):
     def Image(self, *args, **kwargs):
         """Create W&B Image object."""
         return self.writer.Image(*args, **kwargs)
+    
+class CometMLWrapper(BaseLoggerWrapper):
+    """Logger wrapper for Comet ML."""
 
+    def __init__(self, *args, **kwargs):
+        """Initialize Comet ML logging session."""
+        import comet_ml
+
+        project_name = kwargs.pop("project_name", None)
+        experiment_name = kwargs.pop("experiment_name", None)
+        workspace = kwargs.pop("workspace", None)
+        config = kwargs.pop("config", {})
+
+        api_key = os.environ.get("COMET_API_KEY")
+
+        self.experiment = comet_ml.Experiment(
+            project_name=project_name,
+            experiment_name=experiment_name,
+            workspace=workspace,
+            api_key=api_key,
+            *args,
+            **kwargs
+        )
+
+        if config:
+            self.experiment.log_parameters(config)
+
+    def log(self, data: dict, step: int | None = None, commit: bool | None = None, **kwargs):
+        """Log data to Comet ML."""
+        if step is not None:
+            self.experiment.set_step(step)
+            
+        self.experiment.log_metrics(data, **kwargs)
+
+    def finish(self, exit_code: int | None = None, **kwargs):
+        """Finish Comet ML session."""
+        self.experiment.end()
+
+    def Image(self, image, caption=None, step = 0, **kwargs):
+        """Log image to Comet ML and return the PIL Image for compatibility."""
+        if isinstance(image, np.ndarray):
+            pil_image = pil_fromarray(image.astype(np.uint8))
+        elif isinstance(image, jnp.ndarray):
+            pil_image = pil_fromarray(np.array(image).astype(np.uint8))
+        else:
+            pil_image = image
+
+        # Convert to bytes
+        buf = io.BytesIO()
+        pil_image.save(buf, format='PNG')
+        buf.seek(0)
+
+        # Log to Comet ML
+        self.experiment.log_image(
+            image_data=buf,
+            name=caption if caption is not None else 'image',
+            **kwargs
+        )
+
+        # Return PIL Image so that local saving (in Writer) works
+        return pil_image
 
 class Writer:
     """Unified experiment logging interface supporting multiple backends."""
 
-    SUPPORTED_TYPES = ("wandb", "trackio", None)
+    SUPPORTED_TYPES = ("wandb", "trackio", "comet_ml", None)
 
     def init(
         self,
@@ -125,6 +185,8 @@ class Writer:
             self.backend = WandBWrapper(config=config, **kwargs)
         elif writer_type == "trackio":
             self.backend = TrackIOWrapper(config=config, **kwargs)
+        elif writer_type == "comet_ml":
+            self.backend = CometMLWrapper(config = config, **kwargs)
         elif writer_type is None:
             self.backend = None
 
