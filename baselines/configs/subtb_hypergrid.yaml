@@ -8,21 +8,21 @@ num_envs: 16
 agent:
   learning_rate: 1e-3
   eps_exploration: 0.00
-  train_backward: true
-  lmbd: 1.0
+  train_backward: false
+  lmbd: 0.9
   start_eps: 0.0
   end_eps: 0.0
-  exploration_steps: 1_000
+  exploration_steps: 0
 
 network:
   # Input size and output size are computed based on the environment
-  hidden_size: 128
+  hidden_size: 256
   depth: 2
 
 environment:
   reward: "easy"
   dim: 2
-  side: 5
+  side: 10
 
 metrics:
   n_rounds : 10
@@ -30,7 +30,7 @@ metrics:
 
 logging:
   track_each: 1 # in terms of total training steps, not divided by num_envs
-  eval_each: 100 # in terms of total training steps, not divided by num_envs
+  eval_each: 500 # in terms of total training steps, not divided by num_envs
   metric_buffer_size: 200000
   tqdm_print_rate: 20
   use_writer: false
@@ -39,10 +39,10 @@ logging:
 
 # Technical information for writer
 writer:
-  writer_type: wandb # wandb, trackio or null (no logging online)
+  writer_type: comet_ml # wandb, trackio or null (no logging online)
   save_locally: false # Save metrics locally or not
-  entity: null
-  project: sacling_laws
+  entity: azykova-myzina
+  project: hypergrid
 
 # Technical information for hydra
 hydra:

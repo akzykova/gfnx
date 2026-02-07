@@ -7,10 +7,11 @@ num_envs: 16
 
 agent:
   learning_rate: 1e-3
-  train_backward: false
+  baseline_learning_rate: 1e-3
   start_eps: 0.0
   end_eps: 0.0
-  exploration_steps: 0
+  exploration_steps: 0  # Should be <= of num_train_steps
+  train_backward: false
 
 network:
   # Input size and output size are computed based on the environment
@@ -31,10 +32,9 @@ logging:
   eval_each: 500 # in terms of total training steps, not divided by num_envs
   metric_buffer_size: 200000
   tqdm_print_rate: 20
-  use_writer: false
+  use_writer: true
   log_dir: null # If null, dir will be automatically created
   checkpoint_dir: null # If null, dir will be automatically created
-
 # Technical information for writer
 writer:
   writer_type: comet_ml # wandb, trackio or null (no logging online)

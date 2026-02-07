@@ -3,11 +3,14 @@ import json
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+
 import io
 import numpy as np
 import jax.numpy as jnp
 from PIL.Image import Image as PILImage
 from PIL.Image import fromarray as pil_fromarray, open as pil_open
+
+import comet_ml
 
 class BaseLoggerWrapper(ABC):
     """Abstract base class for logger wrappers."""
@@ -98,11 +101,9 @@ class CometMLWrapper(BaseLoggerWrapper):
 
     def __init__(self, *args, **kwargs):
         """Initialize Comet ML logging session."""
-        import comet_ml
-
-        project_name = kwargs.pop("project_name", None)
+        project_name = kwargs.pop("project", None)
         experiment_name = kwargs.pop("experiment_name", None)
-        workspace = kwargs.pop("workspace", None)
+        workspace = kwargs.pop("entity", None)
         config = kwargs.pop("config", {})
 
         api_key = os.environ.get("COMET_API_KEY")
@@ -139,19 +140,16 @@ class CometMLWrapper(BaseLoggerWrapper):
         else:
             pil_image = image
 
-        # Convert to bytes
         buf = io.BytesIO()
         pil_image.save(buf, format='PNG')
         buf.seek(0)
 
-        # Log to Comet ML
         self.experiment.log_image(
             image_data=buf,
             name=caption if caption is not None else 'image',
             **kwargs
         )
 
-        # Return PIL Image so that local saving (in Writer) works
         return pil_image
 
 class Writer:

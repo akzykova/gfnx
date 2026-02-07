@@ -37,13 +37,14 @@ from gfnx.metrics import (
 
 from jax.lax import stop_gradient
 
+import io
+import matplotlib.pyplot as plt
+from PIL.Image import fromarray as pil_fromarray, open as pil_open
 
 from utils.logger import Writer
 from utils.checkpoint import save_checkpoint
 
-import io
 import matplotlib.pyplot as plt
-from PIL.Image import fromarray as pil_fromarray, open as pil_open
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
@@ -112,7 +113,21 @@ class MLPPolicy(eqx.Module):
             "forward_logits": forward_logits,
             "backward_logits": backward_logits,
         }
+    
+class BaselineMLP(eqx.Module):
+    network: eqx.nn.MLP
 
+    def __init__(self, input_size: int, hidden_size: int, depth: int, rng_key: chex.PRNGKey):
+        self.network = eqx.nn.MLP(
+            in_size=input_size,
+            out_size=1,
+            width_size=hidden_size,
+            depth=depth,
+            key=rng_key,
+        )
+
+    def __call__(self, x: chex.Array) -> chex.Array:
+        return self.network(x).squeeze(-1)
 
 # Define the train state that will be used in the training loop
 class TrainState(NamedTuple):
@@ -121,6 +136,7 @@ class TrainState(NamedTuple):
     env: gfnx.HypergridEnvironment
     env_params: chex.Array
     model: MLPPolicy
+    baseline: BaselineMLP
     exploration_schedule: optax.Schedule
     logZ: chex.Array  # Added logZ here
     optimizer: optax.GradientTransformation
@@ -139,6 +155,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
 
     # Get model parameters and static parts
     policy_params, policy_static = eqx.partition(train_state.model, eqx.is_array)
+    baseline_params, baseline_static = eqx.partition(train_state.baseline, eqx.is_array)
 
     # Step 1. Generate a batch of trajectories
     rng_key, sample_traj_key = jax.random.split(rng_key)
@@ -175,22 +192,17 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         env, traj_data, env_params
     )
     rl_reward = log_pb_traj + aux_info["log_gfn_reward"] + aux_info["entropy"]
-    
-    def loss_fn(
-        current_all_params: dict,
-        static_model_parts: MLPPolicy,
-        current_traj_data: gfnx.utils.TrajectoryData,
-        current_env: gfnx.HypergridEnvironment,
-        current_env_params: gfnx.HypergridEnvParams,
+
+
+    def extract_advantage_components(
+            model: MLPPolicy,
+            baseline: BaselineMLP,
+            current_traj_data: gfnx.utils.TrajectoryData,
+            current_env: gfnx.HypergridEnvironment,
+            current_env_params: gfnx.HypergridEnvParams,
     ):
-        # Extract model's learnable parameters and logZ from the input
-        model_learnable_params = current_all_params["model_params"]
-        logZ_val = current_all_params["logZ"]
-
-        # Reconstruct the callable model using its learnable parameters
-        model_to_call = eqx.combine(model_learnable_params, static_model_parts)
-
-        policy_outputs_traj = jax.vmap(jax.vmap(model_to_call))(current_traj_data.obs)
+        policy_outputs_traj = jax.vmap(jax.vmap(model))(current_traj_data.obs)
+        baseline_values = jax.vmap(jax.vmap(baseline))(current_traj_data.obs) 
 
         # Step 2.1 Compute forward actions and log probabilities
         fwd_logits_traj = policy_outputs_traj["forward_logits"]
@@ -256,18 +268,59 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         reward_cumsum = reverse_cumsum(masked_log_rewards_at_steps) + reverse_cumsum(log_pb_selected)
         p_forward_cumsum = reverse_cumsum(fwd_logprobs_traj[:, :-1])
 
-        loss_per_traj = jnp.sum(fwd_logprobs_traj[:, :-1] * (reward_cumsum - stop_gradient(p_forward_cumsum)), axis = 1)
+        V_pred = baseline_values[:, :-1]
+        masked_V_pred = jnp.where(pad_mask_for_bwd, 0.0, V_pred)
 
-        return -jnp.mean(loss_per_traj)
+        baseline_loss = jnp.mean(jnp.square(reward_cumsum - stop_gradient(p_forward_cumsum) - masked_V_pred))
+
+        return {
+            "reward_cumsum": reward_cumsum,
+            "p_forward_cumsum": p_forward_cumsum,
+            "V_pred": masked_V_pred,
+            "p_forward_logprobs": fwd_logprobs_traj[:, :-1],
+            "baseline_loss": baseline_loss
+        }
+        
+    
+    def loss_fn(
+        current_all_params: dict,
+        static_model_parts: MLPPolicy,
+        static_baseline_parts: BaselineMLP,
+        current_traj_data: gfnx.utils.TrajectoryData,
+        current_env: gfnx.HypergridEnvironment,
+        current_env_params: gfnx.HypergridEnvParams,
+    ):
+        model_learnable_params = current_all_params["model_params"]
+        baseline_learnable_params = current_all_params["baseline_params"]
+
+        # Reconstruct the callable model using its learnable parameters
+        model_to_call = eqx.combine(model_learnable_params, static_model_parts)
+        baseline_to_call = eqx.combine(baseline_learnable_params, static_baseline_parts)
+
+        comp = extract_advantage_components(model_to_call, baseline_to_call, current_traj_data, current_env, current_env_params)
+        
+        reward = comp['reward_cumsum'] - stop_gradient(comp['p_forward_cumsum'])
+        baseline = comp['V_pred']
+        p_forward_logprobs = comp['p_forward_logprobs']
+
+        baseline_loss = jnp.mean(jnp.square(reward - baseline))
+        loss_per_traj = jnp.sum(p_forward_logprobs * (reward - stop_gradient(baseline)), axis = 1)
+        policy_loss = -jnp.mean(loss_per_traj)
+
+        total_loss = policy_loss + baseline_loss
+
+        return total_loss
 
     # Prepare parameters for the loss function and gradient calculation
     # policy_params are model network parameters
     # policy_static are model static parts.
-    params_for_loss = {"model_params": policy_params, "logZ": train_state.logZ}
+    params_for_loss = {"model_params": policy_params, "logZ": train_state.logZ, "baseline_params": baseline_params}
 
-    mean_loss, grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
-        params_for_loss, policy_static, traj_data, env, env_params
+    mean_loss, grads = eqx.filter_value_and_grad(loss_fn)(
+        params_for_loss, policy_static, baseline_static, traj_data, env, env_params
     )
+
+    comp = extract_advantage_components(train_state.model, train_state.baseline, traj_data, env, env_params)
 
     # Step 3. Update parameters (model network and logZ)
     # `grads` is a dict {'model_params': ..., 'logZ': ...}
@@ -276,6 +329,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     optax_params_for_update = {
         "model_params": policy_params,
         "logZ": train_state.logZ,
+        "baseline_params": baseline_params,
     }
     updates, new_opt_state = train_state.optimizer.update(
         grads, train_state.opt_state, optax_params_for_update
@@ -285,6 +339,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     # updates contains the deltas for the model's learnable parameters.
     new_model = eqx.apply_updates(train_state.model, updates["model_params"])
     new_logZ = eqx.apply_updates(train_state.logZ, updates["logZ"])
+    new_baseline = eqx.apply_updates(train_state.baseline, updates["baseline_params"])
 
     # Perform all the required logging
     metrics_state = train_state.metrics_module.update(
@@ -391,6 +446,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         idx,
         {
             "mean_loss": mean_loss,
+            "baseline_loss": comp['baseline_loss'],
             "entropy": aux_info["entropy"].mean(),
             "grad_norm": optax.tree_utils.tree_l2_norm(grads),
             "logZ": new_logZ,
@@ -407,6 +463,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     return train_state._replace(
         rng_key=rng_key,
         model=new_model,
+        baseline = new_baseline,
         logZ=new_logZ,
         opt_state=new_opt_state,
         metrics_state=metrics_state,
@@ -414,7 +471,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     )
 
 
-@hydra.main(config_path="configs/", config_name="cumsum_pg_hypergrid", version_base=None)
+@hydra.main(config_path="configs/", config_name="v_baseline_hypergrid", version_base=None)
 def run_experiment(cfg: OmegaConf) -> None:
     # Log the configuration
     log.info(OmegaConf.to_yaml(cfg))
@@ -445,9 +502,16 @@ def run_experiment(cfg: OmegaConf) -> None:
         rng_key=net_init_key,
     )
 
+    rng_key, net_init_key = jax.random.split(rng_key)
+    baseline = BaselineMLP(
+        input_size=env.observation_space.shape[0],
+        hidden_size=cfg.network.hidden_size,
+        depth=cfg.network.depth,
+        rng_key=net_init_key,
+    )
+
     # Partition the model into its learnable parameters and static parts
     policy_static = eqx.filter(model, eqx.is_array, inverse=True)
-
     def fwd_policy_fn(
         rng_key: chex.PRNGKey, env_obs: gfnx.TObs, current_policy_params
     ) -> chex.Array:
@@ -470,18 +534,22 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     # Prepare parameters for Optax
     model_params_init = eqx.filter(model, eqx.is_array)
-    initial_optax_params = {"model_params": model_params_init, "logZ": logZ}
+    baseline_params_init = eqx.filter(baseline, eqx.is_array)
+    initial_optax_params = {"model_params": model_params_init, "logZ": logZ, "baseline_params": baseline_params_init}
 
     # Define parameter labels for multi_transform
     param_labels = {
         "model_params": jax.tree.map(lambda _: "network_lr", model_params_init),
         "logZ": "logZ_lr",
+        "baseline_params": jax.tree.map(lambda _: "baseline_lr", baseline_params_init),
     }
 
     optimizer_defs = {
         "network_lr": optax.adam(learning_rate=cfg.agent.learning_rate),
         "logZ_lr": optax.adam(learning_rate=cfg.agent.logZ_learning_rate),
+        "baseline_lr": optax.adam(learning_rate=cfg.agent.baseline_learning_rate),
     }
+
     optimizer = optax.multi_transform(optimizer_defs, param_labels)
     opt_state = optimizer.init(initial_optax_params)
 
@@ -522,7 +590,7 @@ def run_experiment(cfg: OmegaConf) -> None:
     # Initialize the metrics state
     eval_init_key, new_eval_init_key = jax.random.split(eval_init_key)
     metrics_state = metrics_module.init(
-        eval_init_key,
+        new_eval_init_key,
         metrics_module.InitArgs(
             metrics_args={
                 "approx_dist": ApproxDistributionMetricsModule.InitArgs(env_params=env_params),
@@ -540,6 +608,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         env=env,
         env_params=env_params,
         model=model,
+        baseline = baseline,
         logZ=logZ,
         optimizer=optimizer,
         opt_state=opt_state,
