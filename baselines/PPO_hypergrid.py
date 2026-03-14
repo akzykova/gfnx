@@ -445,11 +445,13 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
                     writer.log(eval_info_for_log, step=idx)
 
         is_last_ppo_step = (
-            (idx + 1 == train_state.config.num_train_steps) | (epoch_i == ppo_epochs - 1)
+            (epoch_i == ppo_epochs - 1)
         )
         is_eval_step = (
-            (idx % train_state.config.logging.eval_each == 0) & is_last_ppo_step
+            (idx % train_state.config.logging.eval_each == 0) | (idx + 1 == train_state.config.num_train_steps) 
         )
+
+        is_eval_step = is_eval_step & is_last_ppo_step
 
         new_metrics_state = train_state.metrics_module.update(
             metrics_state,
