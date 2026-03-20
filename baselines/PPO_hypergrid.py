@@ -348,7 +348,26 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         loss_per_traj = jnp.sum(ppo_clip, axis=1) + jnp.sum(kl, axis=1)
         policy_loss = -jnp.mean(loss_per_traj)
 
-        return policy_loss
+
+        # For logging
+        log_ratio = log_pf_new_sampled - log_pf_old_sampled
+        valid = ~pad_mask
+        n_valid = valid.sum()
+        mean_ratio = jnp.where(valid, ratio, 0.0).sum() / n_valid
+        mean_log_ratio = jnp.where(valid, log_ratio, 0.0).sum() / n_valid
+        max_ratio = jnp.where(valid, ratio, 0.0).max()
+
+        is_clipped = (ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)
+        clip_fraction = jnp.where(valid, is_clipped, False).sum() / n_valid
+
+        ratio_metrics = {
+            "mean_importance_weight": mean_ratio,
+            "mean_log_importance_weight": mean_log_ratio,
+            "max_importance_weight": max_ratio,
+            "clip_fraction": clip_fraction,
+        }
+
+        return policy_loss, ratio_metrics
 
     def baseline_loss_fn(
         baseline_params: BaselineMLP,
@@ -375,7 +394,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     def ppo_epoch_body(epoch_i, carry):
         p_params, b_params, p_opt_state, b_opt_state, metrics_state, eval_info, aux_info = carry
 
-        policy_loss, policy_grads = eqx.filter_value_and_grad(policy_loss_fn)(p_params, aux_info)
+        (policy_loss, ratio_metrics), policy_grads = eqx.filter_value_and_grad(policy_loss_fn, has_aux=True)(p_params, aux_info)
         p_updates, new_p_opt_state = train_state.policy_optimizer.update(
             policy_grads, p_opt_state, p_params
         )
@@ -397,13 +416,12 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             is_last_ppo_step,
             is_eval_step,
         ):
-            if is_last_ppo_step:
-                train_info = {
-                    f"train/{k}": float(v) for k, v in train_info.items()
-                }
-
-                if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
-                    writer.log(train_info, step=idx)
+            if not is_last_ppo_step:
+                return
+            
+            train_info = {
+                f"train/{k}": float(v) for k, v in train_info.items()
+            }
 
             if is_eval_step:
                 log.info(f"Step {idx}")
@@ -443,6 +461,9 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
                     )
 
                     writer.log(eval_info_for_log, step=idx)
+
+            if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
+                writer.log(train_info, step=idx)
 
         is_last_ppo_step = (
             (epoch_i == ppo_epochs - 1)
@@ -512,6 +533,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
                 "mean_reward": jnp.exp(aux_info["log_gfn_reward"]).mean(),
                 "mean_log_reward": aux_info["log_gfn_reward"].mean(),
                 "rl_reward": rl_reward.mean(),
+                **ratio_metrics,
             },
             new_eval_info,
             train_state.config,
@@ -523,7 +545,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         return (
             new_p_params, new_b_params,
             new_p_opt_state, new_b_opt_state,
-            new_metrics_state, new_eval_info, ppo_aux_info
+            new_metrics_state, new_eval_info, aux_info
         )
 
     init_carry = (
