@@ -2,7 +2,7 @@
 
 Run the script with the following command:
 ```bash
-python baselines/tb_hypergrid.py
+python baselines/PPO_hypergrid.py
 ```
 
 Also see https://jax.readthedocs.io/en/latest/gpu_performance_tips.html for
@@ -166,6 +166,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     gae_lambda=train_state.config.agent.gae_lambda
     ppo_epochs = train_state.config.agent.ppo_epochs
     clip_eps = train_state.config.agent.clip_eps
+    gae_lambda=train_state.config.agent.gae_lambda
 
     # Define the policy function suitable for gfnx.utils.forward_rollout
     # Note: policy_params for this function are only the MLPPolicy's network
@@ -275,41 +276,12 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             "forward_logprobs": fwd_logprobs_traj[:, :-1],
             "pad_mask": pad_mask_for_bwd,
         }
-
-
+    
     def compute_gae(deltas, lam):
         def scan_fn(carry, delta):
             return delta + lam * carry, delta + lam * carry
         _, adv_rev = jax.lax.scan(scan_fn, init=0.0, xs=deltas[::-1])
         return adv_rev[::-1]
-    
-    
-    comp_old = extract_advantage_components(train_state.model, train_state.baseline, traj_data, env, env_params)
-
-    V_current = comp_old['V_pred']
-    gflow_logreward = comp_old['gflow_logreward']
-    backward_logprobs = comp_old['backward_logprobs']
-    forward_logprobs = stop_gradient(comp_old['forward_logprobs'])
-    pad_mask = stop_gradient(comp_old['pad_mask'])
-                                           
-    V_next = jnp.roll(V_current, -1, axis=1).at[:, -1].set(0.0)
- 
-    deltas_reward_old = stop_gradient(gflow_logreward + backward_logprobs - forward_logprobs)
-    deltas_reward_old = jnp.where(pad_mask, 0.0, deltas_reward_old)
-    
-    advantages_old = stop_gradient(jax.vmap(compute_gae, in_axes=(0, None))(deltas_reward_old + V_next - V_current, gae_lambda))
-    log_pf_old = stop_gradient(comp_old["full_forward_logprobs"])
-
-    ppo_aux_info = {
-        'advantages_old': advantages_old,
-        'log_pf_old_full': log_pf_old,
-        'log_pf_old_sampled': forward_logprobs,
-        'deltas_old': deltas_reward_old,
-        'pad_mask': pad_mask,
-        'entropy': aux_info["entropy"],
-        'log_gfn_reward': aux_info["log_gfn_reward"],
-        'final_env_state': aux_info["final_env_state"],
-    }
         
     
     def policy_loss_fn(
@@ -345,7 +317,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         kl = jnp.exp(log_pf_new_full) * (log_pf_new_full - log_pf_old_full) # (batch, T, A)
         kl = jnp.where(pad_mask[..., None], 0.0, kl).sum(axis=-1) # (batch, T)
 
-        loss_per_traj = jnp.sum(ppo_clip, axis=1) + jnp.sum(kl, axis=1)
+        loss_per_traj = jnp.sum(ppo_clip, axis=1) - jnp.sum(kl, axis=1)
         policy_loss = -jnp.mean(loss_per_traj)
 
 
@@ -390,9 +362,37 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
 
         value_target = stop_gradient(advantages + V_current)
         return jnp.mean((V_current - value_target) ** 2)
+    
+
+    comp_old = extract_advantage_components(train_state.model, train_state.baseline, traj_data, env, env_params)
+
+    V_current = comp_old['V_pred']
+    gflow_logreward = comp_old['gflow_logreward']
+    backward_logprobs = comp_old['backward_logprobs']
+    forward_logprobs = stop_gradient(comp_old['forward_logprobs'])
+    pad_mask = stop_gradient(comp_old['pad_mask'])
+
+    V_next = jnp.roll(V_current, -1, axis=1).at[:, -1].set(0.0)
+
+    deltas_reward_old = stop_gradient(gflow_logreward + backward_logprobs - forward_logprobs)
+    deltas_reward_old = jnp.where(pad_mask, 0.0, deltas_reward_old)
+
+    advantages_old = stop_gradient(jax.vmap(compute_gae, in_axes=(0, None))(deltas_reward_old + V_next - V_current, gae_lambda))
+    log_pf_old = stop_gradient(comp_old["full_forward_logprobs"])
+
+    ppo_aux_info = {
+        'advantages_old': advantages_old,
+        'log_pf_old_full': log_pf_old,
+        'log_pf_old_sampled': forward_logprobs,
+        'deltas_old': deltas_reward_old,
+        'pad_mask': pad_mask,
+        'entropy': aux_info["entropy"],
+        'log_gfn_reward': aux_info["log_gfn_reward"],
+        'final_env_state': aux_info["final_env_state"],
+    }
 
     def ppo_epoch_body(epoch_i, carry):
-        p_params, b_params, p_opt_state, b_opt_state, metrics_state, eval_info, aux_info = carry
+        p_params, b_params, p_opt_state, b_opt_state, aux_info = carry
 
         (policy_loss, ratio_metrics), policy_grads = eqx.filter_value_and_grad(policy_loss_fn, has_aux=True)(p_params, aux_info)
         p_updates, new_p_opt_state = train_state.policy_optimizer.update(
@@ -406,162 +406,25 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         )
         new_b_params = optax.apply_updates(b_params, b_updates)
 
-        # gradient_step = idx * ppo_epochs + epoch_i
-
-        def logging_callback(
-            idx: int,
-            train_info: dict,
-            eval_info: dict,
-            cfg,
-            is_last_ppo_step,
-            is_eval_step,
-        ):
-            if not is_last_ppo_step:
-                return
-            
-            train_info = {
-                f"train/{k}": float(v) for k, v in train_info.items()
-            }
-
-            if is_eval_step:
-                log.info(f"Step {idx}")
-                log.info(train_info)
-                # Get the evaluation metrics
-                eval_info_for_log = {
-                    f"eval/{key}": float(value)
-                    for key, value in eval_info.items()
-                    if "2d_marginal_distribution" not in key
-                }
-                log.info({
-                    key: value
-                    for key, value in eval_info_for_log.items()
-                    if "2d_marginal_distribution" not in key
-                })
-
-                if cfg.logging.use_writer:
-                    marginal_dist = eval_info["approx_dist/2d_marginal_distribution"]
-                    marginal_dist = (marginal_dist - marginal_dist.min()) / (
-                        marginal_dist.max() - marginal_dist.min()
-                    )
-
-                    plt.figure(figsize=(4, 4))
-                    im = plt.imshow(marginal_dist, cmap='viridis')
-                    plt.colorbar(im)
-                    plt.title(f"2D Marginal Distribution (Step {idx})")
-                    
-                    buf = io.BytesIO()
-                    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-                    plt.close()
-                    buf.seek(0)
-                    pil_img = pil_open(buf)
-
-                    writer.Image(
-                        pil_img,
-                        caption="approx_dist/marginal_dist",
-                    )
-
-                    writer.log(eval_info_for_log, step=idx)
-
-            if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
-                writer.log(train_info, step=idx)
-
-        is_last_ppo_step = (
-            (epoch_i == ppo_epochs - 1)
-        )
-        is_eval_step = (
-            (idx % train_state.config.logging.eval_each == 0) | (idx + 1 == train_state.config.num_train_steps) 
-        )
-
-        is_eval_step = is_eval_step & is_last_ppo_step
-
-        new_metrics_state = train_state.metrics_module.update(
-            metrics_state,
-            rng_key=jax.random.key(0),  # This key is not used in the update method
-            args=train_state.metrics_module.UpdateArgs(
-                metrics_args={
-                    "approx_dist": ApproxDistributionMetricsModule.UpdateArgs(
-                        states=aux_info["final_env_state"]
-                    ),
-                    "exact_dist": ExactDistributionMetricsModule.UpdateArgs(),
-                    "elbo": ELBOMetricsModule.UpdateArgs(),
-                    "eubo": EUBOMetricsModule.UpdateArgs(),
-                }
-            ),
-        )
-
-        new_metrics_state = jax.lax.cond(
-            is_eval_step,
-            lambda kwargs: train_state.metrics_module.process(**kwargs),
-            lambda kwargs: kwargs["metrics_state"],
-            {
-                "metrics_state": new_metrics_state,
-                "rng_key": jax.random.key(0),
-                "args": train_state.metrics_module.ProcessArgs(
-                    metrics_args={
-                        "approx_dist": ApproxDistributionMetricsModule.ProcessArgs(
-                            env_params=env_params
-                        ),
-                        "exact_dist": ExactDistributionMetricsModule.ProcessArgs(
-                            policy_params=new_p_params, env_params=train_state.env_params
-                        ),
-                        "elbo": ELBOMetricsModule.ProcessArgs(
-                            policy_params=new_p_params, env_params=train_state.env_params
-                        ),
-                        "eubo": EUBOMetricsModule.ProcessArgs(
-                            policy_params=new_p_params, env_params=train_state.env_params
-                        ),
-                    }
-                ),
-            },
-        )
-
-        new_eval_info = jax.lax.cond(
-            is_eval_step,
-            lambda metrics_state: train_state.metrics_module.get(metrics_state),
-            lambda metrics_state: eval_info,
-            new_metrics_state,
-        )
-
-        jax.debug.callback(
-            logging_callback,
-            idx,
-            {
-                "mean_loss": policy_loss,
-                "baseline_loss": baseline_loss,
-                "entropy": aux_info["entropy"].mean(),
-                "grad_norm": optax.tree_utils.tree_l2_norm(policy_grads),
-                "mean_reward": jnp.exp(aux_info["log_gfn_reward"]).mean(),
-                "mean_log_reward": aux_info["log_gfn_reward"].mean(),
-                "rl_reward": rl_reward.mean(),
-                **ratio_metrics,
-            },
-            new_eval_info,
-            train_state.config,
-            is_last_ppo_step,
-            is_eval_step,
-            ordered=True,
-        )
-
         return (
             new_p_params, new_b_params,
             new_p_opt_state, new_b_opt_state,
-            new_metrics_state, new_eval_info, aux_info
+            aux_info,
         )
+
 
     init_carry = (
         policy_params,
         baseline_params,
         train_state.policy_opt_state,
         train_state.baseline_opt_state,
-        train_state.metrics_state,
-        train_state.eval_info,
-        ppo_aux_info
+        ppo_aux_info,
     )
 
     (
         final_p_params, final_b_params,
         final_p_opt_state, final_b_opt_state,
-        final_metrics_state, final_eval_info, ppo_aux_info
+        ppo_aux_info,
     ) = jax.lax.fori_loop(
         lower=0,
         upper=ppo_epochs,
@@ -569,17 +432,147 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         init_val=init_carry,
     )
 
+    # Perform all the required logging
+    metrics_state = train_state.metrics_module.update(
+        train_state.metrics_state,
+        rng_key=jax.random.key(0),  # This key is not used in the update method
+        args=train_state.metrics_module.UpdateArgs(
+            metrics_args={
+                "approx_dist": ApproxDistributionMetricsModule.UpdateArgs(
+                    states=aux_info["final_env_state"]
+                ),
+                "exact_dist": ExactDistributionMetricsModule.UpdateArgs(),
+                "elbo": ELBOMetricsModule.UpdateArgs(),
+                "eubo": EUBOMetricsModule.UpdateArgs(),
+            }
+        ),
+    )
+
+    # Perform evaluation computations if needed
+    is_eval_step = idx % train_state.config.logging.eval_each == 0
+    is_eval_step = is_eval_step | (idx + 1 == train_state.config.num_train_steps)
+
+    metrics_state = jax.lax.cond(
+        is_eval_step,
+        lambda kwargs: train_state.metrics_module.process(**kwargs),
+        lambda kwargs: kwargs["metrics_state"],  # Do nothing if not eval step
+        {
+            "metrics_state": metrics_state,
+            "rng_key": jax.random.key(0),  # This key is not used in the process method
+            "args": train_state.metrics_module.ProcessArgs(
+                metrics_args={
+                    "approx_dist": ApproxDistributionMetricsModule.ProcessArgs(
+                        env_params=env_params
+                    ),
+                    "exact_dist": ExactDistributionMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=train_state.env_params
+                    ),
+                    "elbo": ELBOMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=train_state.env_params
+                    ),
+                    "eubo": EUBOMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=train_state.env_params
+                    ),
+                }
+            ),
+        },
+    )
+    eval_info = jax.lax.cond(
+        is_eval_step,
+        lambda metrics_state: train_state.metrics_module.get(metrics_state),
+        lambda metrics_state: train_state.eval_info,  # Do nothing if not eval step
+        metrics_state,
+    )
+
+    # Losses for logging
+    (last_policy_loss, last_ratio_metrics), last_policy_grads = eqx.filter_value_and_grad(
+        policy_loss_fn, has_aux=True
+    )(final_p_params, ppo_aux_info)
+    last_baseline_loss = baseline_loss_fn(final_b_params, ppo_aux_info)
+
+    # Perform the logging via JAX debug callback
+    def logging_callback(
+        idx: int,
+        train_info: dict,
+        eval_info: dict,
+        cfg,
+    ):
+        train_info = {
+            f"train/{k}": float(v) for k, v in train_info.items()
+        }
+
+        if idx % cfg.logging.eval_each == 0 or idx + 1 == cfg.num_train_steps:
+            log.info(f"Step {idx}")
+            log.info(train_info)
+            # Get the evaluation metrics
+            eval_info_for_log = {
+                f"eval/{key}": float(value)
+                for key, value in eval_info.items()
+                if "2d_marginal_distribution" not in key
+            }
+            log.info({
+                key: value
+                for key, value in eval_info_for_log.items()
+                if "2d_marginal_distribution" not in key
+            })
+
+            if cfg.logging.use_writer:
+                marginal_dist = eval_info["approx_dist/2d_marginal_distribution"]
+                marginal_dist = (marginal_dist - marginal_dist.min()) / (
+                    marginal_dist.max() - marginal_dist.min()
+                )
+
+                plt.figure(figsize=(4, 4))
+                im = plt.imshow(marginal_dist, cmap='viridis')
+                plt.colorbar(im)
+                plt.title(f"2D Marginal Distribution (Step {idx})")
+                
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+                plt.close()
+                buf.seek(0)
+                pil_img = pil_open(buf)
+
+                writer.Image(
+                    pil_img,
+                    caption="approx_dist/marginal_dist",
+                )
+
+                writer.log(eval_info_for_log, step=idx)
+
+        if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
+            writer.log(train_info)
+
+    jax.debug.callback(
+        logging_callback,
+        idx,
+        {
+            "mean_loss": last_policy_loss,
+            "baseline_loss": last_baseline_loss,
+            "entropy": aux_info["entropy"].mean(),
+            "grad_norm": optax.tree_utils.tree_l2_norm(last_policy_grads),
+            "mean_reward": jnp.exp(aux_info["log_gfn_reward"]).mean(),
+            "mean_log_reward": aux_info["log_gfn_reward"].mean(),
+            "rl_reward": rl_reward.mean(),
+            **last_ratio_metrics,
+        },
+        eval_info,
+        train_state.config,
+        ordered=True,
+    )
+
+    # Return the updated train state
     new_model = eqx.combine(final_p_params, policy_static)
     new_baseline = eqx.combine(final_b_params, baseline_static)
 
     return train_state._replace(
         rng_key=rng_key,
         model=new_model,
-        baseline = new_baseline,
+        baseline=new_baseline,
         policy_opt_state=final_p_opt_state,
         baseline_opt_state=final_b_opt_state,
-        metrics_state=final_metrics_state,
-        eval_info=final_eval_info,
+        metrics_state=metrics_state,
+        eval_info=eval_info,
     )
 
 
