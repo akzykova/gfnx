@@ -6,12 +6,12 @@ num_train_steps: 1000000
 num_envs: 16
 
 agent:
-  learning_rate: 1e-3
-  start_eps: 1.0
+  learning_rate: 3e-4
+  start_eps: 0.0
   end_eps: 0.0
-  exploration_steps: 50_000 # Should be <= of num_train_steps
-  train_backward: true
-  lmbd: 1.0
+  exploration_steps: 0 # Should be <= of num_train_steps
+  train_backward: false
+  lmbd: 0.9
 
 network:
   # Input size and output size are computed based on the environment
@@ -29,10 +29,11 @@ logging:
 
 # Technical information for writer
 writer:
-  writer_type: wandb # wandb, trackio or null (no logging online)
+  writer_type: comet_ml # wandb, trackio or null (no logging online)
   save_locally: false # Save metrics locally or not
-  entity: null
-  project: EPS
+  entity: azykova-myzina
+  project: tfbind
+  offline_directory: ./comet_offline_logs
 
 # Technical information for hydra
 hydra:

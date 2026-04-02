@@ -291,9 +291,10 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         rng_key=jax.random.key(0),  # not used, but required by the API
         args=train_state.metrics_module.UpdateArgs(
             metrics_args={
-                "approx_distribution": ApproxDistributionMetricsModule.UpdateArgs(
+                "approx_dist": ApproxDistributionMetricsModule.UpdateArgs(
                     states=log_info["final_env_state"]
                 ),
+                "exact_dist": ExactDistributionMetricsModule.UpdateArgs(),
                 "elbo": ELBOMetricsModule.UpdateArgs(),
                 "eubo": EUBOMetricsModule.UpdateArgs(),
                 "rd": SWMeanRewardSWMetricsModule.UpdateArgs(
@@ -317,7 +318,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             "rng_key": eval_rng_key,
             "args": train_state.metrics_module.ProcessArgs(
                 metrics_args={
-                    "approx_distribution": ApproxDistributionMetricsModule.ProcessArgs(
+                    "approx_dist": ApproxDistributionMetricsModule.ProcessArgs(
                         env_params=env_params
                     ),
                     "elbo": ELBOMetricsModule.ProcessArgs(
@@ -348,7 +349,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             eval_info = {f"eval/{key}": float(value) for key, value in eval_info.items()}
             log.info(eval_info)
             if cfg.logging.use_writer:
-                writer.log(eval_info, commit=False)
+                writer.log(eval_info, step=idx)
 
         if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
             writer.log(train_info)
@@ -463,7 +464,7 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     metrics_module = MultiMetricsModule(
         metrics={
-            "approx_distribution": ApproxDistributionMetricsModule(
+            "approx_dist": ApproxDistributionMetricsModule(
                 metrics=["tv", "kl"],
                 env=env,
                 buffer_size=cfg.logging.metric_buffer_size,
@@ -495,9 +496,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         rng_key=eval_init_key,
         args=metrics_module.InitArgs(
             metrics_args={
-                "approx_distribution": ApproxDistributionMetricsModule.InitArgs(
-                    env_params=env_params
-                ),
+                "approx_dist": ApproxDistributionMetricsModule.InitArgs(env_params=env_params),
                 "elbo": ELBOMetricsModule.InitArgs(),
                 "eubo": EUBOMetricsModule.InitArgs(),
                 "rd": SWMeanRewardSWMetricsModule.InitArgs(),
@@ -547,6 +546,7 @@ def run_experiment(cfg: OmegaConf) -> None:
             log_dir=log_dir,
             entity=cfg.writer.entity,
             project=cfg.writer.project,
+            offline_directory=cfg.writer.get("offline_directory", "./comet_offline_logs"),
             tags=["TB", env.name.upper()],
             config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
         )

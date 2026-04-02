@@ -28,6 +28,9 @@ from omegaconf import OmegaConf
 import gfnx
 from gfnx.metrics import (
     ApproxDistributionMetricsModule,
+    ELBOMetricsModule,
+    EUBOMetricsModule,
+    ExactDistributionMetricsModule,
     MultiMetricsModule,
     MultiMetricsState,
     SWMeanRewardSWMetricsModule,
@@ -235,9 +238,12 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         rng_key=jax.random.key(0),  # not used, but required by the API
         args=train_state.metrics_module.UpdateArgs(
             metrics_args={
-                "distribution": ApproxDistributionMetricsModule.UpdateArgs(
+                "approx_dist": ApproxDistributionMetricsModule.UpdateArgs(
                     states=log_info["final_env_state"]
                 ),
+                "exact_dist": ExactDistributionMetricsModule.UpdateArgs(),
+                "elbo": ELBOMetricsModule.UpdateArgs(),
+                "eubo": EUBOMetricsModule.UpdateArgs(),
                 "rd": SWMeanRewardSWMetricsModule.UpdateArgs(
                     rewards=rewards,
                 ),
@@ -259,8 +265,17 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             "rng_key": eval_rng_key,
             "args": train_state.metrics_module.ProcessArgs(
                 metrics_args={
-                    "distribution": ApproxDistributionMetricsModule.ProcessArgs(
+                    "approx_dist": ApproxDistributionMetricsModule.ProcessArgs(
                         env_params=env_params
+                    ),
+                    "exact_dist": ExactDistributionMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=env_params
+                    ),
+                    "elbo": ELBOMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=env_params
+                    ),
+                    "eubo": EUBOMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=env_params
                     ),
                     "rd": SWMeanRewardSWMetricsModule.ProcessArgs(),
                 }
@@ -286,7 +301,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             eval_info = {f"eval/{key}": float(value) for key, value in eval_info.items()}
             log.info(eval_info)
             if cfg.logging.use_writer:
-                writer.log(eval_info, commit=False)
+                writer.log(eval_info, step=idx)
 
         if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
             writer.log(train_info)
@@ -360,12 +375,55 @@ def run_experiment(cfg: OmegaConf) -> None:
     optimizer = optax.adam(learning_rate=cfg.agent.learning_rate)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
+    policy_static = eqx.filter(model, eqx.is_array, inverse=True)
+
+    def fwd_policy_fn(
+        fwd_rng_key: chex.PRNGKey,
+        env_obs: gfnx.TObs,
+        policy_params,  # current_policy_params are network params
+    ) -> chex.Array:
+        # Recombine the network parameters with the static parts of the model
+        current_model = eqx.combine(policy_params, policy_static)
+        policy_outputs = jax.vmap(current_model, in_axes=(0,))(env_obs)
+        return policy_outputs["forward_logits"], policy_outputs
+
+    def bwd_policy_fn(
+        bwd_rng_key: chex.PRNGKey,
+        env_obs: gfnx.TObs,
+        policy_params,  # current_policy_params are network params
+    ) -> chex.Array:
+        # Recombine the network parameters with the static parts of the model
+        current_model = eqx.combine(policy_params, policy_static)
+        policy_outputs = jax.vmap(current_model, in_axes=(0,))(env_obs)
+        return policy_outputs["backward_logits"], policy_outputs
+
     metrics_module = MultiMetricsModule(
         metrics={
-            "distribution": ApproxDistributionMetricsModule(
+            "approx_dist": ApproxDistributionMetricsModule(
                 metrics=["tv", "kl"],
                 env=env,
                 buffer_size=cfg.logging.metric_buffer_size,
+            ),
+            "exact_dist": ExactDistributionMetricsModule(
+                metrics=["tv", "kl"],
+                env=env,
+                fwd_policy_fn=fwd_policy_fn,
+                batch_size=cfg.metrics.batch_size,
+            ),
+            "elbo": ELBOMetricsModule(
+                env=env,
+                env_params=env_params,
+                fwd_policy_fn=fwd_policy_fn,
+                n_rounds=cfg.metrics.n_rounds,
+                batch_size=cfg.num_envs,
+            ),
+            "eubo": EUBOMetricsModule(
+                env=env,
+                env_params=env_params,
+                bwd_policy_fn=bwd_policy_fn,
+                n_rounds=cfg.metrics.n_rounds,
+                batch_size=cfg.num_envs,
+                rng_key=eval_init_key,
             ),
             "rd": SWMeanRewardSWMetricsModule(
                 env=env,
@@ -379,7 +437,10 @@ def run_experiment(cfg: OmegaConf) -> None:
         rng_key=eval_init_key,
         args=metrics_module.InitArgs(
             metrics_args={
-                "distribution": ApproxDistributionMetricsModule.InitArgs(env_params=env_params),
+                "approx_dist": ApproxDistributionMetricsModule.InitArgs(env_params=env_params),
+                "exact_dist": ExactDistributionMetricsModule.InitArgs(env_params=env_params),
+                "elbo": ELBOMetricsModule.InitArgs(),
+                "eubo": EUBOMetricsModule.InitArgs(),
                 "rd": SWMeanRewardSWMetricsModule.InitArgs(),
             }
         ),
@@ -422,6 +483,7 @@ def run_experiment(cfg: OmegaConf) -> None:
             log_dir=log_dir,
             entity=cfg.writer.entity,
             project=cfg.writer.project,
+            offline_directory=cfg.writer.get("offline_directory", "./comet_offline_logs"),
             tags=["DB", env.name.upper()],
             config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
         )
