@@ -118,6 +118,7 @@ class MLPPolicy(eqx.Module):
 class BaselineMLP(eqx.Module):
     encoder: gfnx.networks.Encoder
     pooler: eqx.nn.Linear
+    vocab_size: int
 
     def __init__(
         self,
@@ -125,6 +126,8 @@ class BaselineMLP(eqx.Module):
         *,
         key: chex.PRNGKey,
     ):
+        self.vocab_size = encoder_params["vocab_size"]
+
         encoder_key, pooler_key = jax.random.split(key)
         self.encoder = eqx.nn.MLP(
             in_size=encoder_params["max_length"] * encoder_params["vocab_size"],
