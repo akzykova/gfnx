@@ -30,6 +30,7 @@ from gfnx.metrics import (
     ApproxDistributionMetricsModule,
     ELBOMetricsModule,
     EUBOMetricsModule,
+    ExactDistributionMetricsModule,
     MultiMetricsModule,
     MultiMetricsState,
     SWMeanRewardSWMetricsModule,
@@ -321,6 +322,9 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
                     "approx_dist": ApproxDistributionMetricsModule.ProcessArgs(
                         env_params=env_params
                     ),
+                    "exact_dist": ExactDistributionMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=env_params
+                    ),
                     "elbo": ELBOMetricsModule.ProcessArgs(
                         policy_params=policy_params, env_params=env_params
                     ),
@@ -469,6 +473,12 @@ def run_experiment(cfg: OmegaConf) -> None:
                 env=env,
                 buffer_size=cfg.logging.metric_buffer_size,
             ),
+            "exact_dist": ExactDistributionMetricsModule(
+                metrics=["tv", "kl"],
+                env=env,
+                fwd_policy_fn=fwd_policy_fn,
+                batch_size=cfg.metrics.batch_size,
+            ),
             "elbo": ELBOMetricsModule(
                 env=env,
                 env_params=env_params,
@@ -497,6 +507,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         args=metrics_module.InitArgs(
             metrics_args={
                 "approx_dist": ApproxDistributionMetricsModule.InitArgs(env_params=env_params),
+                "exact_dist": ExactDistributionMetricsModule.InitArgs(env_params=env_params),
                 "elbo": ELBOMetricsModule.InitArgs(),
                 "eubo": EUBOMetricsModule.InitArgs(),
                 "rd": SWMeanRewardSWMetricsModule.InitArgs(),

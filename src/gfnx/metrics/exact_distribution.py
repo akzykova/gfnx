@@ -33,6 +33,7 @@ class ExactDistributionMetricsState(MetricsState):
 
     true_distribution: chex.Array
     exact_distribution: chex.Array
+    terminal_state_indices: chex.Array
 
 
 def marginal_distribution(true_dist: chex.Array, exact_dist: chex.Array) -> chex.Array:
@@ -153,9 +154,22 @@ class ExactDistributionMetricsModule(BaseMetricsModule):
         """
         true_distribution = self.env.get_true_distribution(args.env_params)
         exact_distribution = jnp.ones_like(true_distribution) / true_distribution.size
+        all_states = self.env.get_all_states(args.env_params)
+
+        state_idx = jax.vmap(self.env.state_to_index, in_axes=(0, None))(
+            all_states, args.env_params
+        )
+
+        terminal_mask = all_states.is_terminal
+        num_states = state_idx.shape[0]
+
+        terminal_state_indices = jnp.where(terminal_mask, state_idx + num_states, -1)
+        terminal_state_indices = terminal_state_indices[terminal_state_indices >= 0]
+
         return ExactDistributionMetricsState(
             true_distribution=true_distribution,
             exact_distribution=exact_distribution,
+            terminal_state_indices=terminal_state_indices,
         )
 
     UpdateArgs = EmptyUpdateArgs
@@ -228,7 +242,8 @@ class ExactDistributionMetricsModule(BaseMetricsModule):
             cond_function, one_step, (initial_vector, initial_vector, transition)
         )
 
-        exact_distribution = result[num_states:].reshape(*metrics_state.true_distribution.shape)
+        result_terminal = result[metrics_state.terminal_state_indices]
+        exact_distribution = result_terminal.reshape(metrics_state.true_distribution.shape)
         chex.assert_shape(exact_distribution, metrics_state.true_distribution.shape)
         return metrics_state.replace(exact_distribution=exact_distribution)
 

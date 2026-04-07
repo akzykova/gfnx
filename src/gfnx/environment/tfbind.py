@@ -1,4 +1,5 @@
 from math import prod
+from itertools import product as itertools_product
 
 import chex
 import jax
@@ -26,6 +27,13 @@ class TFBind8Environment(FixedAutoregressiveSequenceEnvironment):
             eos_token=self.char_to_id["[EOS]"],
             pad_token=self.char_to_id["[PAD]"],
         )
+
+        offsets = [0]
+        for k in range(1, self.max_length + 1):
+            offsets.append(offsets[-1] + self.nchar ** (k - 1))
+        self._length_offsets = offsets
+
+        self._num_states = offsets[-1] + self.nchar ** self.max_length  # 87381
 
     @property
     def is_enumerable(self) -> bool:
@@ -79,6 +87,68 @@ class TFBind8Environment(FixedAutoregressiveSequenceEnvironment):
         empirical_dist = empirical_dist.reshape(dist_shape)
         empirical_dist /= empirical_dist.sum()
         return empirical_dist
+    
+    def state_to_index(self, state: EnvState, env_params: EnvParams) -> chex.Array:
+        """Return a unique integer index in [0, num_states) for a single state.
+
+        Indexing scheme:
+          - length = number of non-PAD tokens  (0..8)
+          - offset = _length_offsets[length]
+          - inner  = lexicographic index within the length-block
+          - index  = offset + inner
+        """
+        tokens = state.tokens
+
+        num_pad = jnp.sum(tokens == self.pad_token)
+        length = self.max_length - num_pad
+
+        offsets = jnp.array(self._length_offsets, dtype=jnp.int32)
+        offset = offsets[length]
+
+        positions = jnp.arange(self.max_length)
+        valid = positions < length
+
+        exponents = jnp.where(valid, length - 1 - positions, 0)
+        weights = jnp.pow(self.nchar, exponents).astype(jnp.int32)
+        weights = jnp.where(valid, weights, 0)
+
+        inner = jnp.sum(tokens * weights)
+        return offset + inner
+    
+    def get_all_states(self, env_params: EnvParams) -> EnvState:
+        """Return all 87381 states in state_to_index order.
+
+        Order:
+          1. Empty sequence (length 0).
+          2. All sequences of lengths 1..8 in lexicographic token order.
+
+        States of length 8 are marked as terminal.
+
+        Returns:
+            EnvState with tokens of shape [87381, 8] and flag arrays of shape [87381].
+        """
+        all_tokens = []
+        all_is_terminal = []
+        all_is_initial = []
+
+        all_tokens.append([self.pad_token] * self.max_length)
+        all_is_terminal.append(False)
+        all_is_initial.append(True)
+        
+        for length in range(1, self.max_length + 1):
+            is_terminal = (length == self.max_length)
+            for combo in itertools_product(range(self.nchar), repeat=length):
+                tokens = list(combo) + [self.pad_token] * (self.max_length - length)
+                all_tokens.append(tokens)
+                all_is_terminal.append(is_terminal)
+                all_is_initial.append(False)
+
+        return EnvState(
+            tokens=jnp.array(all_tokens, dtype=jnp.int32),
+            is_terminal=jnp.array(all_is_terminal, dtype=jnp.bool_),
+            is_initial=jnp.array(all_is_initial, dtype=jnp.bool_),
+            is_pad=jnp.zeros(len(all_tokens), dtype=jnp.bool_),
+        )
 
     @property
     def is_mean_reward_tractable(self) -> bool:
