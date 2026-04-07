@@ -10,8 +10,6 @@ import jax.numpy as jnp
 from PIL.Image import Image as PILImage
 from PIL.Image import fromarray as pil_fromarray, open as pil_open
 
-import comet_ml
-
 class BaseLoggerWrapper(ABC):
     """Abstract base class for logger wrappers."""
 
@@ -101,31 +99,41 @@ class CometMLWrapper(BaseLoggerWrapper):
 
     def __init__(self, *args, **kwargs):
         """Initialize Comet ML logging session."""
+        import comet_ml
         project_name = kwargs.pop("project", None)
         experiment_name = kwargs.pop("experiment_name", None)
         workspace = kwargs.pop("entity", None)
+        offline_directory = kwargs.pop("offline_directory", "./comet_offline_logs")
         config = kwargs.pop("config", {})
 
-        api_key = os.environ.get("COMET_API_KEY")
+        api_key = "RarSTWayftpfNt02Ap6dY1zXC"
+        offline_mode = os.environ.get("COMET_OFFLINE", "0") == "1"
 
-        self.experiment = comet_ml.Experiment(
-            project_name=project_name,
-            experiment_name=experiment_name,
-            workspace=workspace,
-            api_key=api_key,
-            *args,
-            **kwargs
-        )
+        if offline_mode:
+            os.makedirs(offline_directory, exist_ok=True)
+            self.experiment = comet_ml.OfflineExperiment(
+                project_name=project_name,
+                experiment_name=experiment_name,
+                workspace=workspace,
+                offline_directory=offline_directory,
+            )
+            print(f"[CometML] Running in offline mode. Logs will be saved to: {offline_directory}")
+        else:
+            self.experiment = comet_ml.Experiment(
+                project_name=project_name,
+                experiment_name=experiment_name,
+                workspace=workspace,
+                api_key=api_key,
+                *args,
+                **kwargs
+            )
 
         if config:
             self.experiment.log_parameters(config)
 
-    def log(self, data: dict, step: int | None = None, commit: bool | None = None, **kwargs):
-        """Log data to Comet ML."""
-        if step is not None:
-            self.experiment.set_step(step)
-            
-        self.experiment.log_metrics(data, **kwargs)
+    def log(self, data: dict, step: int | None = None, **kwargs):
+        """Log data to Comet ML with explicit step per metric."""
+        self.experiment.log_metrics(data, step=step, **kwargs)
 
     def finish(self, exit_code: int | None = None, **kwargs):
         """Finish Comet ML session."""
