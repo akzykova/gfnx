@@ -183,45 +183,94 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     rl_reward = log_pb_traj + log_info["log_gfn_reward"] + log_info["entropy"]
 
     # Step 2. Compute the loss
-    def loss_fn(model: MLPPolicy) -> chex.Array:
-        # Call the network to get the logits
-        policy_outputs = jax.vmap(model, in_axes=(0,))(transitions.obs)
-        # Compute the forward log-probs
-        fwd_logits = policy_outputs["forward_logits"]
-        invalid_mask = env.get_invalid_mask(transitions.state, env_params)
-        masked_fwd_logits = gfnx.utils.mask_logits(fwd_logits, invalid_mask)
-        fwd_all_log_probs = jax.nn.log_softmax(masked_fwd_logits, axis=-1)
-        fwd_logprobs = jnp.take_along_axis(
-            fwd_all_log_probs,
-            jnp.expand_dims(transitions.action, axis=-1),
-            axis=-1,
-        ).squeeze(-1)
-        log_flow = policy_outputs["log_flow"]
+    def loss_fn(
+        current_all_params: dict,
+        static_model_parts: MLPPolicy,
+        current_traj_data: gfnx.utils.TrajectoryData,
+        current_env: gfnx.HypergridEnvironment,
+        current_env_params: gfnx.HypergridEnvParams,
+    ):
+        model_learnable_params = current_all_params["model_params"]
+        model_to_call = eqx.combine(model_learnable_params, static_model_parts)
+        # Compute policy outputs for the whole trajectory
+        policy_outputs_traj = jax.vmap(jax.vmap(model_to_call))(current_traj_data.obs)
+        fwd_logits_traj = policy_outputs_traj["forward_logits"]
+        bwd_logits_traj = policy_outputs_traj["backward_logits"]
+        log_flow_traj = policy_outputs_traj["log_flow"].squeeze(-1)
 
-        # Compute the stats for the next state
-        next_policy_outputs = jax.vmap(model, in_axes=(0,))(transitions.next_obs)
-        bwd_logits = next_policy_outputs["backward_logits"]
-        next_bwd_invalid_mask = env.get_invalid_backward_mask(transitions.next_state, env_params)
-        masked_bwd_logits = gfnx.utils.mask_logits(bwd_logits, next_bwd_invalid_mask)
-        bwd_all_log_probs = jax.nn.log_softmax(masked_bwd_logits, axis=-1)
-        bwd_logprobs = jnp.take_along_axis(
-            bwd_all_log_probs, jnp.expand_dims(bwd_actions, axis=-1), axis=-1
+        batch_size, traj_len_plus1 = current_traj_data.action.shape
+        traj_len = traj_len_plus1 - 1
+
+        # Masks
+        forward_invalid_mask = jax.vmap(
+            current_env.get_invalid_mask, in_axes=(1, None), out_axes=1
+        )(current_traj_data.state, current_env_params)
+        backward_invalid_mask = jax.vmap(
+            current_env.get_invalid_backward_mask, in_axes=(1, None), out_axes=1
+        )(current_traj_data.state, current_env_params)
+        forward_action = current_traj_data.action[:, :-1]
+        # Compute backward actions
+        prev_states = jax.tree.map(lambda x: x[:, :-1], current_traj_data.state)
+        fwd_actions = current_traj_data.action[:, :-1]
+        curr_states = jax.tree.map(lambda x: x[:, 1:], current_traj_data.state)
+        bwd_actions_traj = jax.vmap(
+            current_env.get_backward_action,
+            in_axes=(1, 1, 1, None),
+            out_axes=1,
+        )(prev_states, fwd_actions, curr_states, current_env_params)
+        pad_mask = current_traj_data.pad[:, :-1]
+        done_mask = current_traj_data.done[:, :-1]
+
+        # Forward log-probs
+        pf_logits = gfnx.utils.mask_logits(fwd_logits_traj, forward_invalid_mask)
+        log_pf = jax.nn.log_softmax(pf_logits, axis=-1)[:, :-1]
+        log_pf_along_traj = jnp.take_along_axis(
+            log_pf, jnp.expand_dims(forward_action, axis=-1), axis=-1
         ).squeeze(-1)
-        next_log_flow = next_policy_outputs["log_flow"]
-        # Replace the target with the log_gfn_reward if the episode is done
-        target = jnp.where(
-            transitions.done,
-            bwd_logprobs + transitions.log_gfn_reward,
-            bwd_logprobs + next_log_flow,
+        log_pf_along_traj = jnp.where(pad_mask, 0.0, log_pf_along_traj)
+
+        # Backward log-probs
+        pb_logits = gfnx.utils.mask_logits(bwd_logits_traj, backward_invalid_mask)
+        log_pb = jax.nn.log_softmax(pb_logits, axis=-1)[:, 1:]
+        log_pb_along_traj = jnp.take_along_axis(
+            log_pb, jnp.expand_dims(bwd_actions_traj, axis=-1), axis=-1
+        ).squeeze(-1)
+        log_pb_along_traj = jnp.where(pad_mask, 0.0, log_pb_along_traj)
+
+        # log_flow
+        log_flow_traj = log_flow_traj.at[:, 1:].set(
+            jnp.where(done_mask, current_traj_data.log_gfn_reward[:, :-1], log_flow_traj[:, 1:])
+        )
+        log_flow_traj = log_flow_traj.at[:, 1:].set(
+            jnp.where(pad_mask, 0.0, log_flow_traj[:, 1:])
         )
 
-        # Compute the DB loss with masking
-        num_transition = jnp.logical_not(transitions.pad).sum()
-        loss = optax.l2_loss(
-            jnp.where(transitions.pad, 0.0, fwd_logprobs + log_flow),
-            jnp.where(transitions.pad, 0.0, target),
-        ).sum()
-        return loss / num_transition
+        def process_one_traj(log_pf, log_pb, log_flow, done, pad):
+            def process_pair_idx(i, j, log_pf, log_pb, log_flow, done, pad):
+                def fn():
+                    mask = jnp.logical_and(i <= jnp.arange(traj_len), jnp.arange(traj_len) < j)
+                    weight = jnp.power(train_state.config.agent.lmbd, j - i)
+                    log_pf_subtraj = log_flow[i] + (log_pf * mask).sum()
+                    log_pb_subtraj = log_flow[j] + (log_pb * mask).sum()
+                    loss = optax.losses.squared_error(log_pf_subtraj, log_pb_subtraj)
+                    return weight * loss, weight
+
+                return jax.lax.cond(pad[j - 1], lambda: (0.0, 0.0), fn)
+
+            i, j = jnp.triu_indices(traj_len + 1, k=1)
+            weighted_loss, weighted_norm = jax.vmap(
+                process_pair_idx, in_axes=(0, 0, None, None, None, None, None)
+            )(i, j, log_pf, log_pb, log_flow, done, pad)
+            return weighted_loss.sum() / weighted_norm.sum()
+
+        loss = jax.vmap(process_one_traj)(
+            log_pf_along_traj,
+            log_pb_along_traj,
+            log_flow_traj,
+            done_mask,
+            pad_mask,
+        ).mean()
+        return loss
 
     mean_loss, grads = eqx.filter_value_and_grad(loss_fn)(train_state.model)
     # Step 3. Update the model with grads

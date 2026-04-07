@@ -7,10 +7,12 @@ num_envs: 16
 
 agent:
   learning_rate: 3e-4
-  logZ_learning_rate: 0.05 # New field
+  baseline_learning_rate: 3e-4
   start_eps: 0.0
   end_eps: 0.0
   exploration_steps: 0 # Should be <= of num_train_steps
+  baseline_num_splits: 1
+  gae_lambda: 0.9
   train_backward: false
 
 network:
