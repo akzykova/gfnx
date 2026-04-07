@@ -1,4 +1,5 @@
 from math import prod
+from itertools import product as itertools_product
 
 import chex
 import jax
