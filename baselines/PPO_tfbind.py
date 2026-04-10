@@ -179,7 +179,8 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     # Get epsilon exploration value from config
     cur_eps = train_state.exploration_schedule(idx)
     gae_lambda = train_state.config.agent.gae_lambda
-    ppo_epochs = train_state.config.agent.ppo_epochs
+    ppo_policy_epochs = train_state.config.agent.ppo_policy_epochs
+    ppo_baseline_epochs = train_state.config.agent.ppo_baseline_epochs
     clip_eps = train_state.config.agent.clip_eps
 
     # Define the policy function suitable for gfnx.utils.forward_rollout
@@ -409,49 +410,42 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         'log_pf_old_sampled': forward_logprobs,
         'deltas_old': deltas_reward_old,
         'pad_mask': pad_mask,
-        'entropy': log_info["entropy"],
-        'log_gfn_reward': log_info["log_gfn_reward"],
-        'final_env_state': log_info["final_env_state"],
     }
 
-    def ppo_epoch_body(epoch_i, carry):
-        p_params, b_params, p_opt_state, b_opt_state, aux_info = carry
-
-        (policy_loss, ratio_metrics), policy_grads = eqx.filter_value_and_grad(policy_loss_fn, has_aux=True)(p_params, aux_info)
+    def policy_epoch_body(epoch_i, carry):
+        p_params, p_opt_state = carry
+        (policy_loss, ratio_metrics), policy_grads = eqx.filter_value_and_grad(
+            policy_loss_fn, has_aux=True
+        )(p_params, ppo_aux_info)
         p_updates, new_p_opt_state = train_state.policy_optimizer.update(
             policy_grads, p_opt_state, p_params
         )
         new_p_params = optax.apply_updates(p_params, p_updates)
+        return (new_p_params, new_p_opt_state)
 
-        baseline_loss, baseline_grads = eqx.filter_value_and_grad(baseline_loss_fn)(b_params, aux_info)
+    def baseline_epoch_body(epoch_i, carry):
+        b_params, b_opt_state = carry
+        baseline_loss, baseline_grads = eqx.filter_value_and_grad(baseline_loss_fn)(
+            b_params, ppo_aux_info
+        )
         b_updates, new_b_opt_state = train_state.baseline_optimizer.update(
             baseline_grads, b_opt_state, b_params
         )
         new_b_params = optax.apply_updates(b_params, b_updates)
+        return (new_b_params, new_b_opt_state)
 
-        return (
-            new_p_params, new_b_params,
-            new_p_opt_state, new_b_opt_state,
-            aux_info,
-        )
-
-    init_carry = (
-        policy_params,
-        baseline_params,
-        train_state.policy_opt_state,
-        train_state.baseline_opt_state,
-        ppo_aux_info,
+    final_p_params, final_p_opt_state = jax.lax.fori_loop(
+        lower=0,
+        upper=ppo_policy_epochs,
+        body_fun=policy_epoch_body,
+        init_val=(policy_params, train_state.policy_opt_state),
     )
 
-    (
-        final_p_params, final_b_params,
-        final_p_opt_state, final_b_opt_state,
-        ppo_aux_info,
-    ) = jax.lax.fori_loop(
+    final_b_params, final_b_opt_state = jax.lax.fori_loop(
         lower=0,
-        upper=ppo_epochs,
-        body_fun=ppo_epoch_body,
-        init_val=init_carry,
+        upper=ppo_baseline_epochs,
+        body_fun=baseline_epoch_body,
+        init_val=(baseline_params, train_state.baseline_opt_state),
     )
 
     # Peform all the requied logging

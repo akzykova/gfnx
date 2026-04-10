@@ -522,7 +522,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
                     caption="approx_dist/marginal_dist",
                 )
 
-                writer.log(eval_info_for_log, step=idx, commit=False)
+                writer.log(eval_info_for_log, step=idx)
 
         if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
             writer.log(train_info)
@@ -721,6 +721,7 @@ def run_experiment(cfg: OmegaConf) -> None:
             log_dir=log_dir,
             entity=cfg.writer.entity,
             project=cfg.writer.project,
+            offline_directory=cfg.writer.get("offline_directory", "./comet_offline_logs"),
             tags=["TB", env.name.upper()],
             config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
         )

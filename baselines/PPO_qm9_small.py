@@ -188,7 +188,8 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     # Get epsilon exploration value from config
     cur_eps = train_state.exploration_schedule(idx)
     gae_lambda = train_state.config.agent.gae_lambda
-    ppo_epochs = train_state.config.agent.ppo_epochs
+    ppo_policy_epochs = train_state.config.agent.ppo_policy_epochs
+    ppo_baseline_epochs = train_state.config.agent.ppo_baseline_epochs
     clip_eps = train_state.config.agent.clip_eps
 
     # Define the policy function suitable for gfnx.utils.forward_rollout
@@ -242,7 +243,11 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         policy_outputs_traj = jax.vmap(jax.vmap(model))(current_traj_data.obs)
         baseline_values = jax.vmap(jax.vmap(baseline))(current_traj_data.obs) 
 
+        # Step 2.1 Compute forward actions and log probabilities
         fwd_logits_traj = policy_outputs_traj["forward_logits"]
+
+        # Vmap get_fwd_masks_per_step over the time dimension. For each time
+        # step t, it processes the batch of states state[:, t, ...].
         invalid_fwd_mask = jax.vmap(current_env.get_invalid_mask, in_axes=(1, None), out_axes=1)(
             current_traj_data.state, current_env_params
         )
@@ -257,6 +262,8 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         ).squeeze(-1)
 
         fwd_logprobs_traj = jnp.where(current_traj_data.pad, 0.0, fwd_logprobs_traj)
+        sum_log_pf_along_traj = fwd_logprobs_traj.sum(axis=1)
+
 
         prev_states = jax.tree.map(lambda x: x[:, :-1], current_traj_data.state) # [B, T]
         fwd_actions = current_traj_data.action[:, :-1] # [B, T]
@@ -292,15 +299,16 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         log_rewards_at_steps = current_traj_data.log_gfn_reward[:, :-1]
         masked_log_rewards_at_steps = jnp.where(pad_mask_for_bwd, 0.0, log_rewards_at_steps)
 
-        V_pred = jnp.where(pad_mask_for_bwd, 0.0, baseline_values[:, :-1])
+        V_pred = baseline_values[:, :-1]
+        masked_V_pred = jnp.where(pad_mask_for_bwd, 0.0, V_pred)
 
         return {
+            "full_forward_logprobs": fwd_all_log_probs_traj[:, :-1],
             "gflow_logreward": masked_log_rewards_at_steps, # (B, T)
             "backward_logprobs": log_pb_selected, # (B, T)
-            "V_pred": V_pred,
+            "V_pred": masked_V_pred,
             "forward_logprobs": fwd_logprobs_traj[:, :-1],
             "pad_mask": pad_mask_for_bwd,
-            "obs": current_traj_data.obs,
         }
     
     def compute_gae(deltas, lam):
@@ -411,52 +419,43 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         'log_pf_old_sampled': forward_logprobs,
         'deltas_old': deltas_reward_old,
         'pad_mask': pad_mask,
-        'entropy': log_info["entropy"],
-        'log_gfn_reward': log_info["log_gfn_reward"],
-        'final_env_state': log_info["final_env_state"],
     }
 
-    def ppo_epoch_body(epoch_i, carry):
-        p_params, b_params, p_opt_state, b_opt_state, aux_info = carry
-
-        (policy_loss, ratio_metrics), policy_grads = eqx.filter_value_and_grad(policy_loss_fn, has_aux=True)(p_params, aux_info)
+    def policy_epoch_body(epoch_i, carry):
+        p_params, p_opt_state = carry
+        (policy_loss, ratio_metrics), policy_grads = eqx.filter_value_and_grad(
+            policy_loss_fn, has_aux=True
+        )(p_params, ppo_aux_info)
         p_updates, new_p_opt_state = train_state.policy_optimizer.update(
             policy_grads, p_opt_state, p_params
         )
         new_p_params = optax.apply_updates(p_params, p_updates)
+        return (new_p_params, new_p_opt_state)
 
-        baseline_loss, baseline_grads = eqx.filter_value_and_grad(baseline_loss_fn)(b_params, aux_info)
+    def baseline_epoch_body(epoch_i, carry):
+        b_params, b_opt_state = carry
+        baseline_loss, baseline_grads = eqx.filter_value_and_grad(baseline_loss_fn)(
+            b_params, ppo_aux_info
+        )
         b_updates, new_b_opt_state = train_state.baseline_optimizer.update(
             baseline_grads, b_opt_state, b_params
         )
         new_b_params = optax.apply_updates(b_params, b_updates)
+        return (new_b_params, new_b_opt_state)
 
-        return (
-            new_p_params, new_b_params,
-            new_p_opt_state, new_b_opt_state,
-            aux_info,
-        )
-
-    
-    init_carry = (
-        policy_params,
-        baseline_params,
-        train_state.policy_opt_state,
-        train_state.baseline_opt_state,
-        ppo_aux_info,
-    )
-
-    (
-        final_p_params, final_b_params,
-        final_p_opt_state, final_b_opt_state,
-        ppo_aux_info,
-    ) = jax.lax.fori_loop(
+    final_p_params, final_p_opt_state = jax.lax.fori_loop(
         lower=0,
-        upper=ppo_epochs,
-        body_fun=ppo_epoch_body,
-        init_val=init_carry,
+        upper=ppo_policy_epochs,
+        body_fun=policy_epoch_body,
+        init_val=(policy_params, train_state.policy_opt_state),
     )
 
+    final_b_params, final_b_opt_state = jax.lax.fori_loop(
+        lower=0,
+        upper=ppo_baseline_epochs,
+        body_fun=baseline_epoch_body,
+        init_val=(baseline_params, train_state.baseline_opt_state),
+    )
 
     rewards = env.reward_module.reward(
         log_info["final_env_state"],

@@ -9,7 +9,8 @@ agent:
   learning_rate: 3e-4
   baseline_learning_rate: 3e-4
   gae_lambda: 0.9
-  ppo_epochs: 4
+  ppo_policy_epochs: 2
+  ppo_baseline_epochs: 4
   clip_eps: 0.2
   start_eps: 0.0
   end_eps: 0.0
