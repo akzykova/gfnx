@@ -180,6 +180,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     cur_eps = train_state.exploration_schedule(idx)
     gae_lambda = train_state.config.agent.gae_lambda
     baseline_num_splits = train_state.config.agent.baseline_num_splits
+    baseline_num_epochs=train_state.config.agent.baseline_num_epochs
 
     # Define the policy function suitable for gfnx.utils.forward_rollout
     def fwd_policy_fn(
@@ -370,6 +371,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         env: gfnx.HypergridEnvironment,
         env_params: gfnx.HypergridEnvParams,
         num_splits: int,
+        num_epochs: int,
         gae_lambda: float,
     ):
         comp = extract_advantage_components(
@@ -377,42 +379,54 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         )
 
         B = comp['V_pred'].shape[0]
-        if B % num_splits != 0:
-            new_B = (B // num_splits) * num_splits
-            comp = jax.tree.map(lambda x: x[:new_B], comp)
-            B = new_B
-
         split_size = B // num_splits
 
-        current_params = baseline_params
-        current_opt_state = baseline_opt_state
-        total_loss = 0.0
+        deltas_reward_full = (
+            comp['gflow_logreward']
+            + comp['backward_logprobs']
+            - stop_gradient(comp['forward_logprobs'])
+        )
+        deltas_reward_full = jnp.where(comp['pad_mask'], 0.0, deltas_reward_full)
 
-        for i in range(num_splits):
-            start = i * split_size
-            end = (i + 1) * split_size
+        def run_one_epoch(epoch_i, carry):
+            current_params, current_opt_state, _ = carry
+            total_loss = 0.0
 
-            chunk = jax.tree.map(lambda x: x[start:end], comp)
-            
-            deltas_reward = chunk['gflow_logreward'] + chunk['backward_logprobs'] - stop_gradient(chunk['forward_logprobs'])
-            deltas_reward = jnp.where(chunk['pad_mask'], 0.0, deltas_reward)
+            for i in range(num_splits):
+                start = i * split_size
+                end = (i + 1) * split_size
 
-            loss, grads = eqx.filter_value_and_grad(baseline_loss_fn)(
-                current_params,
-                static_baseline_parts,
-                chunk['obs'],
-                deltas_reward,
-                chunk['pad_mask'],
-                gae_lambda
-            )
+                chunk_obs = jax.tree.map(lambda x: x[start:end], comp['obs'])
+                chunk_deltas = deltas_reward_full[start:end]
+                chunk_pad = comp['pad_mask'][start:end]
 
-            updates, current_opt_state = baseline_optim.update(grads, current_opt_state, current_params)
-            current_params = optax.apply_updates(current_params, updates)
+                loss, grads = eqx.filter_value_and_grad(baseline_loss_fn)(
+                    current_params,
+                    static_baseline_parts,
+                    chunk_obs,
+                    chunk_deltas,
+                    chunk_pad,
+                    gae_lambda,
+                )
 
-            total_loss += loss
+                updates, current_opt_state = baseline_optim.update(
+                    grads, current_opt_state, current_params
+                )
+                current_params = optax.apply_updates(current_params, updates)
+                total_loss += loss
 
-        return current_params, current_opt_state, total_loss / num_splits
+            return current_params, current_opt_state, total_loss / num_splits
+
+        final_params, final_opt_state, last_epoch_loss = jax.lax.fori_loop(
+            lower=0,
+            upper=num_epochs,
+            body_fun=run_one_epoch,
+            init_val=(baseline_params, baseline_opt_state, 0.0),
+        )
+
+        return final_params, final_opt_state, last_epoch_loss
     
+
     new_baseline_params, baseline_new_opt_state, baseline_loss = update_baseline(
         model_to_call=train_state.model,
         baseline_to_call=train_state.baseline,
@@ -424,8 +438,10 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         env=env,
         env_params=env_params,
         num_splits=baseline_num_splits,
+        num_epochs=baseline_num_epochs,
         gae_lambda=gae_lambda
     )
+
     policy_loss, policy_grads = eqx.filter_value_and_grad(policy_loss_fn)(
         policy_params, baseline_params, policy_static, baseline_static, traj_data, env, env_params, gae_lambda
     )
@@ -511,7 +527,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
                 writer.log(eval_info, step=idx)
 
         if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
-            writer.log(train_info)
+            writer.log(train_info, step=idx)
 
     jax.debug.callback(
         logging_callback,

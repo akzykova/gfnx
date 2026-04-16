@@ -2,13 +2,14 @@ seed: 111
 env_init_seed: 1
 eval_init_seed: 2
 
-num_train_steps: 62500
+num_train_steps: 31250
 num_envs: 16
 
 agent:
   learning_rate: 1e-3
   baseline_learning_rate: 1e-3
   baseline_num_splits: 1
+  baseline_num_epochs: 1
   gae_lambda: 0.9
   start_eps: 0.0
   end_eps: 0.0
@@ -30,17 +31,17 @@ metrics:
   batch_size: 1024
 
 logging:
-  track_each: 1 # in terms of total training steps, not divided by num_envs
-  eval_each: 500 # in terms of total training steps, not divided by num_envs
+  track_each: 1000 # in terms of total training steps, not divided by num_envs
+  eval_each: 100 # in terms of total training steps, not divided by num_envs
   metric_buffer_size: 200000
   tqdm_print_rate: 20
-  use_writer: false
+  use_writer: true
   log_dir: null # If null, dir will be automatically created
   checkpoint_dir: null # If null, dir will be automatically created
 # Technical information for writer
 writer:
-  writer_type: comet_ml # wandb, trackio or null (no logging online)
-  save_locally: false # Save metrics locally or not
+  writer_type: null # wandb, trackio or null (no logging online)
+  save_locally: true # Save metrics locally or not
   entity: azykova-myzina
   project: hypergrid
   offline_directory: ./comet_offline_logs

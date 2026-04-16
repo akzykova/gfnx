@@ -2,17 +2,18 @@ seed: 111
 env_init_seed: 1
 eval_init_seed: 2
 
-num_train_steps: 1000000
+num_train_steps: 50000
 num_envs: 16
 
 agent:
   learning_rate: 3e-4
   baseline_learning_rate: 3e-4
+  baseline_num_splits: 1
+  baseline_num_epochs: 1
+  gae_lambda: 0.9
   start_eps: 0.0
   end_eps: 0.0
   exploration_steps: 0 # Should be <= of num_train_steps
-  baseline_num_splits: 1
-  gae_lambda: 0.9
   train_backward: false
 
 network:
@@ -26,7 +27,7 @@ metrics:
 
 logging:
   track_each: 1000 # in terms of total training steps, not divided by num_envs
-  eval_each: 500 # in terms of total training steps, not divided by num_envs
+  eval_each: 100 # in terms of total training steps, not divided by num_envs
   metric_buffer_size: 200000
   tqdm_print_rate: 20
   use_writer: true
@@ -35,8 +36,8 @@ logging:
 
 # Technical information for writer
 writer:
-  writer_type: comet_ml # wandb, trackio or null (no logging online)
-  save_locally: false # Save metrics locally or not
+  writer_type: null # wandb, trackio or null (no logging online)
+  save_locally: true # Save metrics locally or not
   entity: azykova-myzina
   project: qm9
   offline_directory: ./comet_offline_logs
