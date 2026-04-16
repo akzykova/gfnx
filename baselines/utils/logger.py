@@ -217,7 +217,7 @@ class Writer:
             self._save_logs(data, step)
 
         if self.backend:
-            self.backend.log(data, **kwargs)
+            self.backend.log(data, step=step, **kwargs)
 
     def Image(self, data_or_path: str | Path | np.ndarray | PILImage, **kwargs):
         """Create image object for logging from various input formats.
