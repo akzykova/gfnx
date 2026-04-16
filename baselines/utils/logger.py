@@ -206,7 +206,7 @@ class Writer:
             os.makedirs(self.log_dir, exist_ok=True)
             self._save_json("config.json", config)
 
-    def log(self, data: dict, **kwargs):
+    def log(self, data: dict, step=None, **kwargs):
         """Log data to both local storage and backend if configured.
 
         Args:
@@ -214,7 +214,7 @@ class Writer:
             **kwargs: Additional arguments for backend logging
         """
         if self.save_locally:
-            self._save_logs(data)
+            self._save_logs(data, step)
 
         if self.backend:
             self.backend.log(data, **kwargs)
@@ -237,7 +237,7 @@ class Writer:
         if self.backend:
             self.backend.finish(*args, **kwargs)
 
-    def _save_logs(self, data: dict):
+    def _save_logs(self, data: dict, step=None):
         """Save data to local JSONL file with step counter."""
         save_dict = {}
         for key, value in data.items():
@@ -248,8 +248,11 @@ class Writer:
             elif hasattr(value, "image"):
                 save_dict[key] = self._save_image(value.image)
 
-        save_dict["step"] = self._step
-        self._step += 1
+        if step is not None:
+            save_dict["step"] = int(step)
+        else:
+            save_dict["step"] = self._step
+            self._step += 1
 
         log_file = os.path.join(self.log_dir, "log.jsonl")
         with open(log_file, "a", encoding="utf-8") as f:
