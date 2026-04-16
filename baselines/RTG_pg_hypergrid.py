@@ -122,7 +122,6 @@ class TrainState(NamedTuple):
     env_params: chex.Array
     model: MLPPolicy
     exploration_schedule: optax.Schedule
-    logZ: chex.Array  # Added logZ here
     optimizer: optax.GradientTransformation
     opt_state: optax.OptState
     metrics_module: MultiMetricsModule
