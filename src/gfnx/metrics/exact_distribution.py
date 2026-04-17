@@ -160,11 +160,14 @@ class ExactDistributionMetricsModule(BaseMetricsModule):
             all_states, args.env_params
         )
 
-        terminal_mask = all_states.is_terminal
+        all_states = self.env.get_all_states(args.env_params)
         num_states = state_idx.shape[0]
 
-        terminal_state_indices = jnp.where(terminal_mask, state_idx + num_states, -1)
-        terminal_state_indices = terminal_state_indices[terminal_state_indices >= 0]
+        if jnp.any(all_states.is_terminal):
+            terminal_mask = all_states.is_terminal
+            terminal_state_indices = (state_idx + num_states)[terminal_mask]
+        else:
+            terminal_state_indices = jnp.array([], dtype=jnp.int32)
 
         return ExactDistributionMetricsState(
             true_distribution=true_distribution,
@@ -242,8 +245,12 @@ class ExactDistributionMetricsModule(BaseMetricsModule):
             cond_function, one_step, (initial_vector, initial_vector, transition)
         )
 
-        result_terminal = result[metrics_state.terminal_state_indices]
-        exact_distribution = result_terminal.reshape(metrics_state.true_distribution.shape)
+        if metrics_state.terminal_state_indices.shape[0] == 0:
+            exact_distribution = result[num_states:].reshape(*metrics_state.true_distribution.shape)
+        else:
+            result_terminal = result[metrics_state.terminal_state_indices]
+            exact_distribution = result_terminal.reshape(metrics_state.true_distribution.shape)
+
         chex.assert_shape(exact_distribution, metrics_state.true_distribution.shape)
         return metrics_state.replace(exact_distribution=exact_distribution)
 
