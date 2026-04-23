@@ -38,6 +38,8 @@ from gfnx.metrics import (
 from jax.lax import stop_gradient
 
 import io
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from PIL.Image import fromarray as pil_fromarray, open as pil_open
 
@@ -166,6 +168,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     gae_lambda=train_state.config.agent.gae_lambda
     ppo_policy_epochs = train_state.config.agent.ppo_policy_epochs
     ppo_baseline_epochs = train_state.config.agent.ppo_baseline_epochs
+    ppo_baseline_num_splits = train_state.config.agent.ppo_baseline_num_splits
     clip_eps = train_state.config.agent.clip_eps
     gae_lambda=train_state.config.agent.gae_lambda
 
@@ -341,52 +344,52 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         }
 
         return policy_loss, ratio_metrics
-
+    
     def baseline_loss_fn(
         baseline_params: BaselineMLP,
         aux_info: dict
     ):
         deltas_old = aux_info['deltas_old']
         pad_mask = aux_info['pad_mask']
-
+ 
         baseline = eqx.combine(baseline_params, baseline_static)
-        baseline_values = jax.vmap(jax.vmap(baseline))(traj_data.obs)
-
+        baseline_values = jax.vmap(jax.vmap(baseline))(aux_info['obs'])
+ 
         V_current = baseline_values[:, :-1]
         V_current = jnp.where(pad_mask, 0.0, V_current)
         V_next = jnp.roll(V_current, -1, axis=1).at[:, -1].set(0.0)
-
+ 
         deltas = deltas_old + V_next - V_current
         deltas = jnp.where(pad_mask, 0.0, deltas)
-
+ 
         advantages = jax.vmap(compute_gae, in_axes=(0, None))(deltas, gae_lambda)
-
+ 
         value_target = stop_gradient(advantages + V_current)
         return jnp.mean((V_current - value_target) ** 2)
     
-
     comp_old = extract_advantage_components(train_state.model, train_state.baseline, traj_data, env, env_params)
-
+ 
     V_current = comp_old['V_pred']
     gflow_logreward = comp_old['gflow_logreward']
     backward_logprobs = comp_old['backward_logprobs']
     forward_logprobs = stop_gradient(comp_old['forward_logprobs'])
     pad_mask = stop_gradient(comp_old['pad_mask'])
-
+ 
     V_next = jnp.roll(V_current, -1, axis=1).at[:, -1].set(0.0)
-
+ 
     deltas_reward_old = stop_gradient(gflow_logreward + backward_logprobs - forward_logprobs)
     deltas_reward_old = jnp.where(pad_mask, 0.0, deltas_reward_old)
-
+ 
     advantages_old = stop_gradient(jax.vmap(compute_gae, in_axes=(0, None))(deltas_reward_old + V_next - V_current, gae_lambda))
     log_pf_old = stop_gradient(comp_old["full_forward_logprobs"])
-
+ 
     ppo_aux_info = {
         'advantages_old': advantages_old,
         'log_pf_old_full': log_pf_old,
         'log_pf_old_sampled': forward_logprobs,
         'deltas_old': deltas_reward_old,
         'pad_mask': pad_mask,
+        'obs': traj_data.obs,
     }
 
     def policy_epoch_body(epoch_i, carry):
@@ -401,15 +404,27 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         return (new_p_params, new_p_opt_state)
 
     def baseline_epoch_body(epoch_i, carry):
-        b_params, b_opt_state = carry
-        baseline_loss, baseline_grads = eqx.filter_value_and_grad(baseline_loss_fn)(
-            b_params, ppo_aux_info
-        )
-        b_updates, new_b_opt_state = train_state.baseline_optimizer.update(
-            baseline_grads, b_opt_state, b_params
-        )
-        new_b_params = optax.apply_updates(b_params, b_updates)
-        return (new_b_params, new_b_opt_state)
+        b_params, b_opt_state, _ = carry
+        B = ppo_aux_info['pad_mask'].shape[0]
+        split_size = B // ppo_baseline_num_splits
+        total_loss = 0.0
+ 
+        for i in range(ppo_baseline_num_splits):
+            start = i * split_size
+            end = (i + 1) * split_size
+ 
+            chunk_aux = jax.tree.map(lambda x: x[start:end], ppo_aux_info)
+ 
+            chunk_loss, chunk_grads = eqx.filter_value_and_grad(baseline_loss_fn)(
+                b_params, chunk_aux
+            )
+            b_updates, b_opt_state = train_state.baseline_optimizer.update(
+                chunk_grads, b_opt_state, b_params
+            )
+            b_params = optax.apply_updates(b_params, b_updates)
+            total_loss += chunk_loss
+ 
+        return (b_params, b_opt_state, total_loss / ppo_baseline_num_splits)
 
     final_p_params, final_p_opt_state = jax.lax.fori_loop(
         lower=0,
@@ -418,11 +433,11 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         init_val=(policy_params, train_state.policy_opt_state),
     )
 
-    final_b_params, final_b_opt_state = jax.lax.fori_loop(
+    final_b_params, final_b_opt_state, baseline_loss = jax.lax.fori_loop(
         lower=0,
         upper=ppo_baseline_epochs,
         body_fun=baseline_epoch_body,
-        init_val=(baseline_params, train_state.baseline_opt_state),
+        init_val=(baseline_params, train_state.baseline_opt_state, 0.0),
     )
 
     # Perform all the required logging
@@ -481,7 +496,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     (last_policy_loss, last_ratio_metrics), last_policy_grads = eqx.filter_value_and_grad(
         policy_loss_fn, has_aux=True
     )(final_p_params, ppo_aux_info)
-    last_baseline_loss = baseline_loss_fn(final_b_params, ppo_aux_info)
 
     # Perform the logging via JAX debug callback
     def logging_callback(
@@ -541,7 +555,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         idx,
         {
             "mean_loss": last_policy_loss,
-            "baseline_loss": last_baseline_loss,
+            "baseline_loss": baseline_loss,
             "entropy": aux_info["entropy"].mean(),
             "grad_norm": optax.tree_utils.tree_l2_norm(last_policy_grads),
             "mean_reward": jnp.exp(aux_info["log_gfn_reward"]).mean(),
