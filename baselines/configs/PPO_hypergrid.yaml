@@ -8,15 +8,16 @@ num_envs: 16
 agent:
   learning_rate: 1e-3
   baseline_learning_rate: 3e-4
+  tlm_backward_learning_rate: 1e-4
   gae_lambda: 0.7
-  ppo_policy_epochs: 2
-  ppo_baseline_epochs: 2
+  ppo_policy_epochs: 4
+  ppo_baseline_epochs: 4
   ppo_baseline_num_splits: 2
   clip_eps: 0.2
   start_eps: 0.0
   end_eps: 0.0
   exploration_steps: 0  # Should be <= of num_train_steps
-  train_backward: false
+  train_backward: true
 
 network:
   # Input size and output size are computed based on the environment
@@ -25,8 +26,8 @@ network:
 
 environment:
   reward: "easy"
-  dim: 2
-  side: 10
+  dim: 4
+  side: 20
 
 metrics:
   n_rounds : 10

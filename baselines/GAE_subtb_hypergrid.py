@@ -1,8 +1,8 @@
-"""Single-file implementation for Proximal Policy Optimization in hypergrid environment.
+"""Single-file implementation for Policy Gradient with GAE in hypergrid environment.
 
 Run the script with the following command:
 ```bash
-python baselines/PPO_hypergrid.py
+python baselines/GAE_subtb_hypergrid.py
 ```
 
 Also see https://jax.readthedocs.io/en/latest/gpu_performance_tips.html for
@@ -147,9 +147,6 @@ class TrainState(NamedTuple):
     metrics_module: MultiMetricsModule
     metrics_state: MultiMetricsState
     eval_info: dict
-    # TLM
-    tlm_backward_optimizer: optax.GradientTransformation
-    tlm_backward_opt_state: optax.OptState
 
 
 @eqx.filter_jit
@@ -168,11 +165,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
 
     # Get epsilon exploration value from config
     cur_eps = train_state.exploration_schedule(idx)
-    gae_lambda=train_state.config.agent.gae_lambda
-    ppo_policy_epochs = train_state.config.agent.ppo_policy_epochs
-    ppo_baseline_epochs = train_state.config.agent.ppo_baseline_epochs
-    ppo_baseline_num_splits = train_state.config.agent.ppo_baseline_num_splits
-    clip_eps = train_state.config.agent.clip_eps
     gae_lambda=train_state.config.agent.gae_lambda
 
     # Define the policy function suitable for gfnx.utils.forward_rollout
@@ -276,12 +268,12 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         masked_V_pred = jnp.where(pad_mask_for_bwd, 0.0, V_pred)
 
         return {
-            "full_forward_logprobs": fwd_all_log_probs_traj[:, :-1],
             "gflow_logreward": masked_log_rewards_at_steps, # (B, T)
             "backward_logprobs": log_pb_selected, # (B, T)
             "V_pred": masked_V_pred,
             "forward_logprobs": fwd_logprobs_traj[:, :-1],
             "pad_mask": pad_mask_for_bwd,
+            "obs": current_traj_data.obs,
         }
     
     def compute_gae(deltas, lam):
@@ -293,201 +285,116 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     
     def policy_loss_fn(
         model_params: MLPPolicy,
-        aux_info: dict
+        baseline_params: BaselineMLP,
+        static_model_parts: MLPPolicy,
+        static_baseline_parts: BaselineMLP,
+        current_traj_data: gfnx.utils.TrajectoryData,
+        current_env: gfnx.HypergridEnvironment,
+        current_env_params: gfnx.HypergridEnvParams,
+        gae_lambda: float,
     ):
-        pad_mask = aux_info['pad_mask']
-        advantages_old = aux_info['advantages_old']
-        log_pf_old_full = aux_info["log_pf_old_full"]
-        log_pf_old_sampled = aux_info["log_pf_old_sampled"]
+        model_to_call = eqx.combine(model_params, static_model_parts)
+        baseline_to_call = eqx.combine(baseline_params, static_baseline_parts)
 
-        model_to_call = eqx.combine(model_params, policy_static)
-        policy_outputs = jax.vmap(jax.vmap(model_to_call))(traj_data.obs)
-        invalid_fwd_mask = jax.vmap(env.get_invalid_mask, in_axes=(1, None), out_axes=1)(
-            traj_data.state, env_params
-        )
-        masked_fwd_logits_traj = gfnx.utils.mask_logits(policy_outputs["forward_logits"], invalid_fwd_mask)
-        log_pf_new_full = jax.nn.log_softmax(masked_fwd_logits_traj, axis=-1)
+        comp = extract_advantage_components(model_to_call, baseline_to_call, current_traj_data, current_env, current_env_params)
+    
+        baseline_values = comp['V_pred']
+        gflow_logreward = comp['gflow_logreward']
+        backward_logprobs = comp['backward_logprobs']
+        forward_logprobs = comp['forward_logprobs']
+        pad_mask = comp['pad_mask']
+                                           
+        V_current = baseline_values
+        V_next = jnp.roll(V_current, -1, axis=1)
+        V_next = V_next.at[:, -1].set(0.0)
 
-        fwd_logprobs_traj = jnp.take_along_axis(
-            log_pf_new_full,
-            jnp.expand_dims(traj_data.action, axis=-1),
-            axis=-1,
-        ).squeeze(-1)
-        log_pf_new_sampled = jnp.where(traj_data.pad, 0.0, fwd_logprobs_traj)[:, :-1]
+        deltas = gflow_logreward + stop_gradient(backward_logprobs) - stop_gradient(forward_logprobs) + V_next - V_current
+        deltas = jnp.where(pad_mask, 0.0, deltas)
 
-        ratio = jnp.exp(log_pf_new_sampled - log_pf_old_sampled)
-        clipped_ratio = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-        ppo_clip = jnp.minimum(ratio * advantages_old, clipped_ratio * advantages_old)
-        ppo_clip = jnp.where(pad_mask, 0.0, ppo_clip) # (batch, T)
-        
-        log_pf_new_full = log_pf_new_full[:, :-1]
-        kl = jnp.exp(log_pf_new_full) * (log_pf_new_full - log_pf_old_full) # (batch, T, A)
-        kl = jnp.where(pad_mask[..., None], 0.0, kl).sum(axis=-1) # (batch, T)
+        advantages = jax.vmap(compute_gae, in_axes=(0, None))(deltas, gae_lambda)
 
-        loss_per_traj = jnp.sum(ppo_clip, axis=1) - jnp.sum(kl, axis=1)
+        loss_per_traj = jnp.sum(forward_logprobs * stop_gradient(advantages), axis = 1)
         policy_loss = -jnp.mean(loss_per_traj)
 
+        return policy_loss
 
-        # For logging
-        log_ratio = log_pf_new_sampled - log_pf_old_sampled
-        valid = ~pad_mask
-        n_valid = valid.sum()
-        mean_ratio = jnp.where(valid, ratio, 0.0).sum() / n_valid
-        mean_log_ratio = jnp.where(valid, log_ratio, 0.0).sum() / n_valid
-        max_ratio = jnp.where(valid, ratio, 0.0).max()
-
-        is_clipped = (ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)
-        clip_fraction = jnp.where(valid, is_clipped, False).sum() / n_valid
-
-        ratio_metrics = {
-            "mean_importance_weight": mean_ratio,
-            "mean_log_importance_weight": mean_log_ratio,
-            "max_importance_weight": max_ratio,
-            "clip_fraction": clip_fraction,
-        }
-
-        return policy_loss, ratio_metrics
     
     def baseline_loss_fn(
-        baseline_params: BaselineMLP,
-        aux_info: dict
+        baseline_params,
+        static_baseline_parts,
+        model_params,
+        static_model_parts,
+        current_traj_data,
+        current_env,
+        current_env_params,
     ):
-        deltas_old = aux_info['deltas_old']
-        pad_mask = aux_info['pad_mask']
- 
-        baseline = eqx.combine(baseline_params, baseline_static)
-        baseline_values = jax.vmap(jax.vmap(baseline))(aux_info['obs'])
- 
-        V_current = baseline_values[:, :-1]
-        V_current = jnp.where(pad_mask, 0.0, V_current)
-        V_next = jnp.roll(V_current, -1, axis=1).at[:, -1].set(0.0)
- 
-        deltas = deltas_old + V_next - V_current
-        deltas = jnp.where(pad_mask, 0.0, deltas)
- 
-        advantages = jax.vmap(compute_gae, in_axes=(0, None))(deltas, gae_lambda)
- 
-        value_target = stop_gradient(advantages + V_current)
-        return jnp.mean((V_current - value_target) ** 2)
+        model_to_call = eqx.combine(model_params, static_model_parts)
+        baseline_to_call = eqx.combine(baseline_params, static_baseline_parts)
+        comp = extract_advantage_components(model_to_call, baseline_to_call, current_traj_data, current_env, current_env_params)
+
+        log_pf = stop_gradient(comp['forward_logprobs'])
+        log_pb = stop_gradient(comp['backward_logprobs'])
     
+        V = jax.vmap(jax.vmap(baseline_to_call))(current_traj_data.obs)
 
-    def tlm_backward_loss_fn(model_params):
-        model_to_call = eqx.combine(model_params, policy_static)
-        baseline_to_call = eqx.combine(stop_gradient(baseline_params), baseline_static)
-        
-        comp = extract_advantage_components(
-            model_to_call,
-            baseline_to_call,
-            stop_gradient(traj_data),
-            env,
-            env_params,
+        batch_size, traj_len_plus1 = current_traj_data.action.shape
+        traj_len = traj_len_plus1 - 1
+
+        pad_mask = current_traj_data.pad[:, :-1]
+        done_mask = current_traj_data.done[:, :-1]
+
+        # log_flow
+        V = V.at[:, 1:].set(
+            jnp.where(done_mask, current_traj_data.log_gfn_reward[:, :-1], V[:, 1:])
         )
-        
-        log_pb = comp['backward_logprobs']
-        loss_per_traj = -log_pb.sum(axis=1)
-        return loss_per_traj.mean()   
-
-    use_tlm = train_state.config.agent.get("train_backward", True)
-
-    def do_tlm_update(args):
-        p_params, tlm_opt_state = args
-        tlm_loss, tlm_grads = eqx.filter_value_and_grad(tlm_backward_loss_fn)(p_params)
-        tlm_updates, new_tlm_opt_state = train_state.tlm_backward_optimizer.update(
-            tlm_grads, tlm_opt_state, p_params
+        V = V.at[:, 1:].set(
+            jnp.where(pad_mask, 0.0, V[:, 1:])
         )
-        new_p_params = optax.apply_updates(p_params, tlm_updates)
-        return new_p_params, new_tlm_opt_state, tlm_loss
 
-    def skip_tlm_update(args):
-        p_params, tlm_opt_state = args
-        return p_params, tlm_opt_state, jnp.array(0.0)
+        def process_one_traj(log_pf, log_pb, log_flow, done, pad):
+            def process_pair_idx(i, j, log_pf, log_pb, log_flow, done, pad):
+                def fn():
+                    mask = jnp.logical_and(i <= jnp.arange(traj_len), jnp.arange(traj_len) < j)
+                    weight = jnp.power(train_state.config.agent.lmbd, j - i)
+                    log_pf_subtraj = log_flow[i] + (log_pf * mask).sum()
+                    log_pb_subtraj = log_flow[j] + (log_pb * mask).sum()
+                    loss = optax.losses.squared_error(log_pf_subtraj, log_pb_subtraj)
+                    return weight * loss, weight
 
-    policy_params_after_tlm, tlm_opt_state_after, tlm_loss = jax.lax.cond(
-        use_tlm,
-        do_tlm_update,
-        skip_tlm_update,
-        (policy_params, train_state.tlm_backward_opt_state),
+                return jax.lax.cond(pad[j - 1], lambda: (0.0, 0.0), fn)
+
+            i, j = jnp.triu_indices(traj_len + 1, k=1)
+            weighted_loss, weighted_norm = jax.vmap(
+                process_pair_idx, in_axes=(0, 0, None, None, None, None, None)
+            )(i, j, log_pf, log_pb, log_flow, done, pad)
+            return weighted_loss.sum() / weighted_norm.sum()
+
+        loss = jax.vmap(process_one_traj)(
+            log_pf,
+            log_pb,
+            V,
+            done_mask,
+            pad_mask,
+        ).mean()
+        return loss
+
+
+    policy_loss, policy_grads = eqx.filter_value_and_grad(policy_loss_fn)(
+        policy_params, baseline_params, policy_static, baseline_static, traj_data, env, env_params, gae_lambda
+    )
+    policy_updates, policy_new_opt_state = train_state.policy_optimizer.update(
+        policy_grads, train_state.policy_opt_state, policy_params
     )
 
-    model_after_tlm = eqx.combine(policy_params_after_tlm, policy_static)
-    comp_old = extract_advantage_components(
-        model_after_tlm,
-        train_state.baseline,
-        traj_data,
-        env,
-        env_params,
+    baseline_loss, baseline_grads = eqx.filter_value_and_grad(baseline_loss_fn)(
+        baseline_params, baseline_static, policy_params, policy_static, traj_data, env, env_params
     )
- 
-    V_current = stop_gradient(comp_old['V_pred'])
-    gflow_logreward = stop_gradient(comp_old['gflow_logreward'])
-    backward_logprobs = stop_gradient(comp_old['backward_logprobs'])
-    forward_logprobs = stop_gradient(comp_old['forward_logprobs'])
-    pad_mask = stop_gradient(comp_old['pad_mask'])
- 
-    V_next = jnp.roll(V_current, -1, axis=1).at[:, -1].set(0.0)
- 
-    deltas_reward_old = stop_gradient(gflow_logreward + backward_logprobs - forward_logprobs)
-    deltas_reward_old = jnp.where(pad_mask, 0.0, deltas_reward_old)
- 
-    advantages_old = stop_gradient(jax.vmap(compute_gae, in_axes=(0, None))(deltas_reward_old + V_next - V_current, gae_lambda))
-    log_pf_old = stop_gradient(comp_old["full_forward_logprobs"])
- 
-    ppo_aux_info = {
-        'advantages_old': advantages_old,
-        'log_pf_old_full': log_pf_old,
-        'log_pf_old_sampled': forward_logprobs,
-        'deltas_old': deltas_reward_old,
-        'pad_mask': pad_mask,
-        'obs': traj_data.obs,
-    }
-
-    def policy_epoch_body(epoch_i, carry):
-        p_params, p_opt_state = carry
-        (policy_loss, ratio_metrics), policy_grads = eqx.filter_value_and_grad(
-            policy_loss_fn, has_aux=True
-        )(p_params, ppo_aux_info)
-        p_updates, new_p_opt_state = train_state.policy_optimizer.update(
-            policy_grads, p_opt_state, p_params
-        )
-        new_p_params = optax.apply_updates(p_params, p_updates)
-        return (new_p_params, new_p_opt_state)
-
-    def baseline_epoch_body(epoch_i, carry):
-        b_params, b_opt_state, _ = carry
-        B = ppo_aux_info['pad_mask'].shape[0]
-        split_size = B // ppo_baseline_num_splits
-        total_loss = 0.0
- 
-        for i in range(ppo_baseline_num_splits):
-            start = i * split_size
-            end = (i + 1) * split_size
- 
-            chunk_aux = jax.tree.map(lambda x: x[start:end], ppo_aux_info)
- 
-            chunk_loss, chunk_grads = eqx.filter_value_and_grad(baseline_loss_fn)(
-                b_params, chunk_aux
-            )
-            b_updates, b_opt_state = train_state.baseline_optimizer.update(
-                chunk_grads, b_opt_state, b_params
-            )
-            b_params = optax.apply_updates(b_params, b_updates)
-            total_loss += chunk_loss
- 
-        return (b_params, b_opt_state, total_loss / ppo_baseline_num_splits)
-
-    final_p_params, final_p_opt_state = jax.lax.fori_loop(
-        lower=0,
-        upper=ppo_policy_epochs,
-        body_fun=policy_epoch_body,
-        init_val=(policy_params_after_tlm, train_state.policy_opt_state),
+    baseline_updates, baseline_new_opt_state = train_state.baseline_optimizer.update(
+        baseline_grads, train_state.baseline_opt_state, baseline_params
     )
 
-    final_b_params, final_b_opt_state, baseline_loss = jax.lax.fori_loop(
-        lower=0,
-        upper=ppo_baseline_epochs,
-        body_fun=baseline_epoch_body,
-        init_val=(baseline_params, train_state.baseline_opt_state, 0.0),
-    )
+    new_model = eqx.apply_updates(train_state.model, policy_updates)
+    new_baseline = eqx.apply_updates(train_state.baseline, baseline_updates)
 
     # Perform all the required logging
     metrics_state = train_state.metrics_module.update(
@@ -541,11 +448,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         metrics_state,
     )
 
-    # Losses for logging
-    (last_policy_loss, last_ratio_metrics), last_policy_grads = eqx.filter_value_and_grad(
-        policy_loss_fn, has_aux=True
-    )(final_p_params, ppo_aux_info)
-
     # Perform the logging via JAX debug callback
     def logging_callback(
         idx: int,
@@ -597,21 +499,19 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
                 writer.log(eval_info_for_log, step=idx)
 
         if cfg.logging.use_writer and idx % cfg.logging.track_each == 0:
-            writer.log(train_info)
+            writer.log(train_info, step=idx)
 
     jax.debug.callback(
         logging_callback,
         idx,
         {
-            "mean_loss": last_policy_loss,
+            "mean_loss": policy_loss,
             "baseline_loss": baseline_loss,
-            "tlm_backward_loss": tlm_loss,
             "entropy": aux_info["entropy"].mean(),
-            "grad_norm": optax.tree_utils.tree_l2_norm(last_policy_grads),
+            "grad_norm": optax.tree_utils.tree_l2_norm(policy_grads),
             "mean_reward": jnp.exp(aux_info["log_gfn_reward"]).mean(),
             "mean_log_reward": aux_info["log_gfn_reward"].mean(),
             "rl_reward": rl_reward.mean(),
-            **last_ratio_metrics,
         },
         eval_info,
         train_state.config,
@@ -619,22 +519,18 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     )
 
     # Return the updated train state
-    new_model = eqx.combine(final_p_params, policy_static)
-    new_baseline = eqx.combine(final_b_params, baseline_static)
-
     return train_state._replace(
         rng_key=rng_key,
         model=new_model,
-        baseline=new_baseline,
-        policy_opt_state=final_p_opt_state,
-        baseline_opt_state=final_b_opt_state,
-        tlm_backward_opt_state=tlm_opt_state_after,
+        baseline = new_baseline,
+        policy_opt_state=policy_new_opt_state,
+        baseline_opt_state=baseline_new_opt_state,
         metrics_state=metrics_state,
         eval_info=eval_info,
     )
 
 
-@hydra.main(config_path="configs/", config_name="PPO_hypergrid", version_base=None)
+@hydra.main(config_path="configs/", config_name="GAE_subtb_hypergrid", version_base=None)
 def run_experiment(cfg: OmegaConf) -> None:
     # Log the configuration
     log.info(OmegaConf.to_yaml(cfg))
@@ -697,21 +593,9 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     policy_optimizer = optax.adam(learning_rate=cfg.agent.learning_rate)
     baseline_optimizer = optax.adam(learning_rate=cfg.agent.baseline_learning_rate)
-    tlm_backward_lr = cfg.agent.get("tlm_backward_learning_rate", cfg.agent.learning_rate)
-    tlm_backward_schedule = optax.exponential_decay(
-        init_value=tlm_backward_lr,
-        transition_steps=cfg.num_train_steps,
-        decay_rate=0.95,
-        staircase=False,
-    )
-
-    tlm_backward_optimizer = optax.adam(
-        learning_rate=tlm_backward_schedule
-    )
 
     policy_opt_state = policy_optimizer.init(model_params)
     baseline_opt_state = baseline_optimizer.init(baseline_params)
-    tlm_backward_opt_state = tlm_backward_optimizer.init(model_params)
 
     exploration_schedule = optax.linear_schedule(
         init_value=cfg.agent.start_eps,
@@ -777,8 +661,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         metrics_state=metrics_state,
         eval_info=eval_info,
         exploration_schedule=exploration_schedule,
-        tlm_backward_optimizer=tlm_backward_optimizer,
-        tlm_backward_opt_state=tlm_backward_opt_state,
     )
 
     # Partition the initial TrainState into dynamic (jittable) and static parts
