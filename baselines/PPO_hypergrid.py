@@ -147,6 +147,9 @@ class TrainState(NamedTuple):
     metrics_module: MultiMetricsModule
     metrics_state: MultiMetricsState
     eval_info: dict
+    # TLM
+    tlm_backward_optimizer: optax.GradientTransformation
+    tlm_backward_opt_state: optax.OptState
 
 
 @eqx.filter_jit
@@ -367,11 +370,57 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         value_target = stop_gradient(advantages + V_current)
         return jnp.mean((V_current - value_target) ** 2)
     
-    comp_old = extract_advantage_components(train_state.model, train_state.baseline, traj_data, env, env_params)
+
+    def tlm_backward_loss_fn(model_params):
+        model_to_call = eqx.combine(model_params, policy_static)
+        baseline_to_call = eqx.combine(stop_gradient(baseline_params), baseline_static)
+        
+        comp = extract_advantage_components(
+            model_to_call,
+            baseline_to_call,
+            stop_gradient(traj_data),
+            env,
+            env_params,
+        )
+        
+        log_pb = comp['backward_logprobs']
+        loss_per_traj = -log_pb.sum(axis=1)
+        return loss_per_traj.mean()   
+
+    use_tlm = train_state.config.agent.get("train_backward", True)
+
+    def do_tlm_update(args):
+        p_params, tlm_opt_state = args
+        tlm_loss, tlm_grads = eqx.filter_value_and_grad(tlm_backward_loss_fn)(p_params)
+        tlm_updates, new_tlm_opt_state = train_state.tlm_backward_optimizer.update(
+            tlm_grads, tlm_opt_state, p_params
+        )
+        new_p_params = optax.apply_updates(p_params, tlm_updates)
+        return new_p_params, new_tlm_opt_state, tlm_loss
+
+    def skip_tlm_update(args):
+        p_params, tlm_opt_state = args
+        return p_params, tlm_opt_state, jnp.array(0.0)
+
+    policy_params_after_tlm, tlm_opt_state_after, tlm_loss = jax.lax.cond(
+        use_tlm,
+        do_tlm_update,
+        skip_tlm_update,
+        (policy_params, train_state.tlm_backward_opt_state),
+    )
+
+    model_after_tlm = eqx.combine(policy_params_after_tlm, policy_static)
+    comp_old = extract_advantage_components(
+        model_after_tlm,
+        train_state.baseline,
+        traj_data,
+        env,
+        env_params,
+    )
  
-    V_current = comp_old['V_pred']
-    gflow_logreward = comp_old['gflow_logreward']
-    backward_logprobs = comp_old['backward_logprobs']
+    V_current = stop_gradient(comp_old['V_pred'])
+    gflow_logreward = stop_gradient(comp_old['gflow_logreward'])
+    backward_logprobs = stop_gradient(comp_old['backward_logprobs'])
     forward_logprobs = stop_gradient(comp_old['forward_logprobs'])
     pad_mask = stop_gradient(comp_old['pad_mask'])
  
@@ -430,7 +479,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         lower=0,
         upper=ppo_policy_epochs,
         body_fun=policy_epoch_body,
-        init_val=(policy_params, train_state.policy_opt_state),
+        init_val=(policy_params_after_tlm, train_state.policy_opt_state),
     )
 
     final_b_params, final_b_opt_state, baseline_loss = jax.lax.fori_loop(
@@ -556,6 +605,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         {
             "mean_loss": last_policy_loss,
             "baseline_loss": baseline_loss,
+            "tlm_backward_loss": tlm_loss,
             "entropy": aux_info["entropy"].mean(),
             "grad_norm": optax.tree_utils.tree_l2_norm(last_policy_grads),
             "mean_reward": jnp.exp(aux_info["log_gfn_reward"]).mean(),
@@ -578,6 +628,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         baseline=new_baseline,
         policy_opt_state=final_p_opt_state,
         baseline_opt_state=final_b_opt_state,
+        tlm_backward_opt_state=tlm_opt_state_after,
         metrics_state=metrics_state,
         eval_info=eval_info,
     )
@@ -646,9 +697,21 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     policy_optimizer = optax.adam(learning_rate=cfg.agent.learning_rate)
     baseline_optimizer = optax.adam(learning_rate=cfg.agent.baseline_learning_rate)
+    tlm_backward_lr = cfg.agent.get("tlm_backward_learning_rate", cfg.agent.learning_rate)
+    tlm_backward_schedule = optax.exponential_decay(
+        init_value=tlm_backward_lr,
+        transition_steps=cfg.num_train_steps,
+        decay_rate=0.95,
+        staircase=False,
+    )
+
+    tlm_backward_optimizer = optax.adam(
+        learning_rate=tlm_backward_schedule
+    )
 
     policy_opt_state = policy_optimizer.init(model_params)
     baseline_opt_state = baseline_optimizer.init(baseline_params)
+    tlm_backward_opt_state = tlm_backward_optimizer.init(model_params)
 
     exploration_schedule = optax.linear_schedule(
         init_value=cfg.agent.start_eps,
@@ -714,6 +777,8 @@ def run_experiment(cfg: OmegaConf) -> None:
         metrics_state=metrics_state,
         eval_info=eval_info,
         exploration_schedule=exploration_schedule,
+        tlm_backward_optimizer=tlm_backward_optimizer,
+        tlm_backward_opt_state=tlm_backward_opt_state,
     )
 
     # Partition the initial TrainState into dynamic (jittable) and static parts
