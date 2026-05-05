@@ -690,8 +690,8 @@ def run_experiment(cfg: OmegaConf) -> None:
     tlm_backward_lr = cfg.agent.get("tlm_backward_learning_rate", cfg.agent.learning_rate)
     tlm_backward_schedule = optax.exponential_decay(
         init_value=tlm_backward_lr,
-        transition_steps=cfg.num_train_steps,
-        decay_rate=0.95,
+        transition_steps=1,
+        decay_rate=0.999,
         staircase=False,
     )
 
