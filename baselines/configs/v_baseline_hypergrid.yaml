@@ -10,10 +10,6 @@ agent:
   baseline_learning_rate: 1e-3
   baseline_num_splits: 1
   baseline_num_epochs: 1
-  start_eps: 0.0
-  end_eps: 0.0
-  exploration_steps: 0  # Should be <= of num_train_steps
-  train_backward: false
 
 network:
   # Input size and output size are computed based on the environment

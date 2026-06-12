@@ -7,10 +7,6 @@ num_envs: 16
 
 agent:
   learning_rate: 3e-4
-  start_eps: 0.0
-  end_eps: 0.0
-  exploration_steps: 0 # Should be <= of num_train_steps
-  train_backward: false
 
 network:
   # Input size and output size are computed based on the environment

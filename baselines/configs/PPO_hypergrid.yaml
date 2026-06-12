@@ -13,10 +13,8 @@ agent:
   ppo_policy_epochs: 4
   ppo_baseline_epochs: 4
   ppo_baseline_num_splits: 2
+  tlm_epochs: 4
   clip_eps: 0.2
-  start_eps: 0.0
-  end_eps: 0.0
-  exploration_steps: 0  # Should be <= of num_train_steps
   train_backward: true
 
 network:
