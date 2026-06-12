@@ -63,8 +63,6 @@ class MLPPolicy(eqx.Module):
         n_fwd_actions (int): Number of forward actions.
         n_bwd_actions (int): Number of backward actions.
         hidden_size (int): The size of the hidden layers in the MLP.
-        train_backward_policy (bool): Flag indicating whether to train
-            the backward policy.
         depth (int): The number of layers in the MLP.
         rng_key (chex.PRNGKey): Random key for initializing the MLP.
 
@@ -75,7 +73,6 @@ class MLPPolicy(eqx.Module):
     """
 
     network: eqx.nn.MLP
-    train_backward_policy: bool
     n_fwd_actions: int
     n_bwd_actions: int
 
@@ -85,17 +82,13 @@ class MLPPolicy(eqx.Module):
         n_fwd_actions: int,
         n_bwd_actions: int,
         hidden_size: int,
-        train_backward_policy: bool,
         depth: int,
         rng_key: chex.PRNGKey,
     ):
-        self.train_backward_policy = train_backward_policy
         self.n_fwd_actions = n_fwd_actions
         self.n_bwd_actions = n_bwd_actions
 
         output_size = self.n_fwd_actions
-        if train_backward_policy:
-            output_size += n_bwd_actions
         self.network = eqx.nn.MLP(
             in_size=input_size,
             out_size=output_size,
@@ -105,12 +98,8 @@ class MLPPolicy(eqx.Module):
         )
 
     def __call__(self, x: chex.Array) -> chex.Array:
-        x = self.network(x)
-        if self.train_backward_policy:
-            forward_logits, backward_logits = jnp.split(x, [self.n_fwd_actions], axis=-1)
-        else:
-            forward_logits = x
-            backward_logits = jnp.zeros(shape=(self.n_bwd_actions,), dtype=jnp.float32)
+        forward_logits = self.network(x)
+        backward_logits = jnp.zeros(shape=(self.n_bwd_actions,), dtype=jnp.float32)
         return {
             "forward_logits": forward_logits,
             "backward_logits": backward_logits,
@@ -139,7 +128,6 @@ class TrainState(NamedTuple):
     env_params: chex.Array
     model: MLPPolicy
     baseline: BaselineMLP
-    exploration_schedule: optax.Schedule
     policy_optimizer: optax.GradientTransformation
     baseline_optimizer: optax.GradientTransformation
     policy_opt_state: optax.OptState
@@ -163,8 +151,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     # Step 1. Generate a batch of trajectories
     rng_key, sample_traj_key = jax.random.split(rng_key)
 
-    # Get epsilon exploration value from config
-    cur_eps = train_state.exploration_schedule(idx)
     gae_lambda=train_state.config.agent.gae_lambda
 
     # Define the policy function suitable for gfnx.utils.forward_rollout
@@ -176,11 +162,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         policy_outputs = jax.vmap(current_model, in_axes=(0,))(env_obs)
         fwd_logits = policy_outputs["forward_logits"]
 
-        # Apply epsilon exploration to logits
-        rng_key, exploration_key = jax.random.split(rng_key)
-        batch_size, _ = fwd_logits.shape
-        exploration_mask = jax.random.bernoulli(exploration_key, cur_eps, (batch_size,))
-        fwd_logits = jnp.where(exploration_mask[..., None], 0, fwd_logits)
         return fwd_logits, policy_outputs
 
     traj_data, aux_info = gfnx.utils.forward_rollout(
@@ -556,7 +537,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         n_fwd_actions=env.action_space.n,
         n_bwd_actions=env.backward_action_space.n,
         hidden_size=cfg.network.hidden_size,
-        train_backward_policy=cfg.agent.train_backward,
         depth=cfg.network.depth,
         rng_key=net_init_key,
     )
@@ -597,11 +577,6 @@ def run_experiment(cfg: OmegaConf) -> None:
     policy_opt_state = policy_optimizer.init(model_params)
     baseline_opt_state = baseline_optimizer.init(baseline_params)
 
-    exploration_schedule = optax.linear_schedule(
-        init_value=cfg.agent.start_eps,
-        end_value=cfg.agent.end_eps,
-        transition_steps=cfg.agent.exploration_steps,
-    )
 
     metrics_module = MultiMetricsModule({
         "approx_dist": ApproxDistributionMetricsModule(
@@ -660,7 +635,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         metrics_module=metrics_module,
         metrics_state=metrics_state,
         eval_info=eval_info,
-        exploration_schedule=exploration_schedule,
     )
 
     # Partition the initial TrainState into dynamic (jittable) and static parts

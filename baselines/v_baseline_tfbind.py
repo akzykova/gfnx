@@ -54,7 +54,6 @@ class MLPPolicy(eqx.Module):
 
     encoder: gfnx.networks.Encoder
     pooler: eqx.nn.Linear
-    train_backward_policy: bool
     n_fwd_actions: int
     n_bwd_actions: int
 
@@ -62,18 +61,14 @@ class MLPPolicy(eqx.Module):
         self,
         n_fwd_actions: int,
         n_bwd_actions: int,
-        train_backward_policy: bool,
         encoder_params: dict,
         *,
         key: chex.PRNGKey,
     ):
-        self.train_backward_policy = train_backward_policy
         self.n_fwd_actions = n_fwd_actions
         self.n_bwd_actions = n_bwd_actions
 
         output_size = self.n_fwd_actions
-        if train_backward_policy:
-            output_size += n_bwd_actions
 
         encoder_key, pooler_key = jax.random.split(key)
         self.encoder = eqx.nn.MLP(
@@ -98,12 +93,8 @@ class MLPPolicy(eqx.Module):
     ) -> chex.Array:
         obs_ids = jax.nn.one_hot(obs_ids[1:], 5).reshape(-1)
         encoded_obs = self.encoder(obs_ids)
-        output = self.pooler(encoded_obs)
-        if self.train_backward_policy:
-            forward_logits, backward_logits = jnp.split(output, [self.n_fwd_actions], axis=-1)
-        else:
-            forward_logits = output
-            backward_logits = jnp.zeros(shape=(self.n_bwd_actions,), dtype=jnp.float32)
+        forward_logits = self.pooler(encoded_obs)
+        backward_logits = jnp.zeros(shape=(self.n_bwd_actions,), dtype=jnp.float32)
         return {
             "forward_logits": forward_logits,
             "backward_logits": backward_logits,
@@ -161,7 +152,6 @@ class TrainState(NamedTuple):
     baseline_opt_state: optax.OptState
     metrics_module: MultiMetricsModule
     metrics_state: MultiMetricsState
-    exploration_schedule: optax.Schedule
     eval_info: dict
 
 
@@ -176,8 +166,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     # Split the model to pass into forward rollout
     policy_params, policy_static = eqx.partition(train_state.model, eqx.is_array)
     baseline_params, baseline_static = eqx.partition(train_state.baseline, eqx.is_array)
-    # Get epsilon exploration value from config
-    cur_eps = train_state.exploration_schedule(idx)
+
     baseline_num_splits = train_state.config.agent.baseline_num_splits
     baseline_num_epochs=train_state.config.agent.baseline_num_epochs
 
@@ -194,16 +183,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
 
         # Get forward logits
         fwd_logits = policy_outputs["forward_logits"]
-
-        # Apply epsilon exploration to logits
-        if train:
-            rng_key, exploration_key = jax.random.split(fwd_rng_key)
-            batch_size, _ = fwd_logits.shape
-            exploration_mask = jax.random.bernoulli(exploration_key, cur_eps, (batch_size,))
-            fwd_logits = jnp.where(exploration_mask[..., None], 0, fwd_logits)
-        # Update policy outputs with modified logits
-        policy_outputs = policy_outputs.copy()
-        policy_outputs["forward_logits"] = fwd_logits
 
         return fwd_logits, policy_outputs
 
@@ -564,7 +543,6 @@ def run_experiment(cfg: OmegaConf) -> None:
     model = MLPPolicy(
         n_fwd_actions=env.action_space.n,
         n_bwd_actions=env.backward_action_space.n,
-        train_backward_policy=cfg.agent.train_backward,
         encoder_params={
             "pad_id": env.pad_token,
             "vocab_size": env.ntoken,
@@ -585,11 +563,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         key=baseline_init_key,
     )
 
-    exploration_schedule = optax.linear_schedule(
-        init_value=cfg.agent.start_eps,
-        end_value=cfg.agent.end_eps,
-        transition_steps=cfg.agent.exploration_steps,
-    )
 
     model_params = eqx.filter(model, eqx.is_array)
     baseline_params = eqx.filter(baseline, eqx.is_array)
@@ -685,7 +658,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         baseline_opt_state=baseline_opt_state,
         metrics_module=metrics_module,
         metrics_state=metrics_state,
-        exploration_schedule=exploration_schedule,
         eval_info=eval_info,
     )
     # Split train state into parameters and static parts to make jit work.

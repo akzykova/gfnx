@@ -160,7 +160,6 @@ class TrainState(NamedTuple):
     baseline_opt_state: optax.OptState
     metrics_module: MultiMetricsModule
     metrics_state: MultiMetricsState
-    exploration_schedule: optax.Schedule
     eval_info: dict
     # TLM
     tlm_backward_optimizer: optax.GradientTransformation
@@ -179,8 +178,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     policy_params, policy_static = eqx.partition(train_state.model, eqx.is_array)
     baseline_params, baseline_static = eqx.partition(train_state.baseline, eqx.is_array)
 
-    # Get epsilon exploration value from config
-    cur_eps = train_state.exploration_schedule(idx)
     gae_lambda = train_state.config.agent.gae_lambda
     ppo_policy_epochs = train_state.config.agent.ppo_policy_epochs
     ppo_baseline_epochs = train_state.config.agent.ppo_baseline_epochs
@@ -200,16 +197,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
 
         # Get forward logits
         fwd_logits = policy_outputs["forward_logits"]
-
-        # Apply epsilon exploration to logits
-        if train:
-            rng_key, exploration_key = jax.random.split(fwd_rng_key)
-            batch_size, _ = fwd_logits.shape
-            exploration_mask = jax.random.bernoulli(exploration_key, cur_eps, (batch_size,))
-            fwd_logits = jnp.where(exploration_mask[..., None], 0, fwd_logits)
-        # Update policy outputs with modified logits
-        policy_outputs = policy_outputs.copy()
-        policy_outputs["forward_logits"] = fwd_logits
 
         return fwd_logits, policy_outputs
 
@@ -411,12 +398,26 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
 
     def do_tlm_update(args):
         p_params, tlm_opt_state = args
-        tlm_loss, tlm_grads = eqx.filter_value_and_grad(tlm_backward_loss_fn)(p_params)
-        tlm_updates, new_tlm_opt_state = train_state.tlm_backward_optimizer.update(
-            tlm_grads, tlm_opt_state, p_params
+
+        def tlm_epoch_body(epoch_i, carry):
+            p_params, tlm_opt_state = carry
+            tlm_loss, tlm_grads = eqx.filter_value_and_grad(tlm_backward_loss_fn)(p_params)
+            tlm_updates, new_tlm_opt_state = train_state.tlm_backward_optimizer.update(
+                tlm_grads, tlm_opt_state, p_params
+            )
+            new_p_params = optax.apply_updates(p_params, tlm_updates)
+            return (new_p_params, new_tlm_opt_state)
+
+        tlm_epochs = train_state.config.agent.get("tlm_epochs", 1)
+        final_p_params, final_tlm_opt_state = jax.lax.fori_loop(
+            lower=0,
+            upper=tlm_epochs,
+            body_fun=tlm_epoch_body,
+            init_val=(p_params, tlm_opt_state),
         )
-        new_p_params = optax.apply_updates(p_params, tlm_updates)
-        return new_p_params, new_tlm_opt_state, tlm_loss
+
+        tlm_loss = tlm_backward_loss_fn(final_p_params)
+        return final_p_params, final_tlm_opt_state, tlm_loss
 
     def skip_tlm_update(args):
         p_params, tlm_opt_state = args
@@ -668,12 +669,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         key=baseline_init_key,
     )
 
-    exploration_schedule = optax.linear_schedule(
-        init_value=cfg.agent.start_eps,
-        end_value=cfg.agent.end_eps,
-        transition_steps=cfg.agent.exploration_steps,
-    )
-
     # Prepare parameters for Optax
     model_params = eqx.filter(model, eqx.is_array)
     baseline_params = eqx.filter(baseline, eqx.is_array)
@@ -782,7 +777,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         baseline_opt_state=baseline_opt_state,
         metrics_module=metrics_module,
         metrics_state=metrics_state,
-        exploration_schedule=exploration_schedule,
         eval_info=eval_info,
         tlm_backward_optimizer=tlm_backward_optimizer,
         tlm_backward_opt_state=tlm_backward_opt_state,

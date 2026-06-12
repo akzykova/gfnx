@@ -139,7 +139,6 @@ class TrainState(NamedTuple):
     env_params: chex.Array
     model: MLPPolicy
     baseline: BaselineMLP
-    exploration_schedule: optax.Schedule
     policy_optimizer: optax.GradientTransformation
     baseline_optimizer: optax.GradientTransformation
     policy_opt_state: optax.OptState
@@ -166,14 +165,11 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     # Step 1. Generate a batch of trajectories
     rng_key, sample_traj_key = jax.random.split(rng_key)
 
-    # Get epsilon exploration value from config
-    cur_eps = train_state.exploration_schedule(idx)
     gae_lambda=train_state.config.agent.gae_lambda
     ppo_policy_epochs = train_state.config.agent.ppo_policy_epochs
     ppo_baseline_epochs = train_state.config.agent.ppo_baseline_epochs
     ppo_baseline_num_splits = train_state.config.agent.ppo_baseline_num_splits
     clip_eps = train_state.config.agent.clip_eps
-    gae_lambda=train_state.config.agent.gae_lambda
 
     # Define the policy function suitable for gfnx.utils.forward_rollout
     # Note: policy_params for this function are only the MLPPolicy's network
@@ -184,11 +180,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         policy_outputs = jax.vmap(current_model, in_axes=(0,))(env_obs)
         fwd_logits = policy_outputs["forward_logits"]
 
-        # Apply epsilon exploration to logits
-        rng_key, exploration_key = jax.random.split(rng_key)
-        batch_size, _ = fwd_logits.shape
-        exploration_mask = jax.random.bernoulli(exploration_key, cur_eps, (batch_size,))
-        fwd_logits = jnp.where(exploration_mask[..., None], 0, fwd_logits)
         return fwd_logits, policy_outputs
 
     traj_data, aux_info = gfnx.utils.forward_rollout(
@@ -391,12 +382,26 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
 
     def do_tlm_update(args):
         p_params, tlm_opt_state = args
-        tlm_loss, tlm_grads = eqx.filter_value_and_grad(tlm_backward_loss_fn)(p_params)
-        tlm_updates, new_tlm_opt_state = train_state.tlm_backward_optimizer.update(
-            tlm_grads, tlm_opt_state, p_params
+
+        def tlm_epoch_body(epoch_i, carry):
+            p_params, tlm_opt_state = carry
+            tlm_loss, tlm_grads = eqx.filter_value_and_grad(tlm_backward_loss_fn)(p_params)
+            tlm_updates, new_tlm_opt_state = train_state.tlm_backward_optimizer.update(
+                tlm_grads, tlm_opt_state, p_params
+            )
+            new_p_params = optax.apply_updates(p_params, tlm_updates)
+            return (new_p_params, new_tlm_opt_state)
+
+        tlm_epochs = train_state.config.agent.get("tlm_epochs", 1)
+        final_p_params, final_tlm_opt_state = jax.lax.fori_loop(
+            lower=0,
+            upper=tlm_epochs,
+            body_fun=tlm_epoch_body,
+            init_val=(p_params, tlm_opt_state),
         )
-        new_p_params = optax.apply_updates(p_params, tlm_updates)
-        return new_p_params, new_tlm_opt_state, tlm_loss
+
+        tlm_loss = tlm_backward_loss_fn(final_p_params)
+        return final_p_params, final_tlm_opt_state, tlm_loss
 
     def skip_tlm_update(args):
         p_params, tlm_opt_state = args
@@ -713,12 +718,6 @@ def run_experiment(cfg: OmegaConf) -> None:
     baseline_opt_state = baseline_optimizer.init(baseline_params)
     tlm_backward_opt_state = tlm_backward_optimizer.init(model_params)
 
-    exploration_schedule = optax.linear_schedule(
-        init_value=cfg.agent.start_eps,
-        end_value=cfg.agent.end_eps,
-        transition_steps=cfg.agent.exploration_steps,
-    )
-
     metrics_module = MultiMetricsModule({
         "approx_dist": ApproxDistributionMetricsModule(
             metrics=["tv", "kl", "2d_marginal_distribution"],
@@ -776,7 +775,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         metrics_module=metrics_module,
         metrics_state=metrics_state,
         eval_info=eval_info,
-        exploration_schedule=exploration_schedule,
         tlm_backward_optimizer=tlm_backward_optimizer,
         tlm_backward_opt_state=tlm_backward_opt_state,
     )
