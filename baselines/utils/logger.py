@@ -131,9 +131,8 @@ class CometMLWrapper(BaseLoggerWrapper):
         if config:
             self.experiment.log_parameters(config)
 
-    def log(self, data: dict, step: int | None = None, **kwargs):
-        """Log data to Comet ML with explicit step per metric."""
-        self.experiment.log_metrics(data, step=step, **kwargs)
+    def log(self, data: dict, step: int | None = None, commit: bool | None = None, **kwargs):
+        self.experiment.log_metrics(data, step=step)
 
     def finish(self, exit_code: int | None = None, **kwargs):
         """Finish Comet ML session."""
