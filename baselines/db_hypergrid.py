@@ -535,7 +535,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         hydra.core.hydra_config.HydraConfig.get().runtime.output_dir,
         f"checkpoints_{os.getpid()}/",
     )
-    save_checkpoint(os.path.join(dir, "train_state"), train_state)
+    # save_checkpoint(os.path.join(dir, "train_state"), train_state)
     save_checkpoint(os.path.join(dir, "model"), train_state.model)
 
 
