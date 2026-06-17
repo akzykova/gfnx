@@ -2,7 +2,7 @@
 
 Run the script with the following command:
 ```bash
-python baselines/db_qm9_small.py
+python baselines/subtb_qm9_small.py
 ```
 
 Also see https://jax.readthedocs.io/en/latest/gpu_performance_tips.html for
@@ -381,7 +381,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     )
 
 
-@hydra.main(config_path="configs/", config_name="db_qm9_small", version_base=None)
+@hydra.main(config_path="configs/", config_name="subtb_qm9_small", version_base=None)
 def run_experiment(cfg: OmegaConf) -> None:
     # Log the configuration
     log.info(OmegaConf.to_yaml(cfg))
