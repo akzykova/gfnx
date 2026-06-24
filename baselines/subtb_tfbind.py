@@ -30,6 +30,7 @@ from gfnx.metrics import (
     ApproxDistributionMetricsModule,
     ELBOMetricsModule,
     EUBOMetricsModule,
+    ExactDistributionMetricsModule,
     MultiMetricsModule,
     MultiMetricsState,
     SWMeanRewardSWMetricsModule,
@@ -323,6 +324,9 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
                     "approx_dist": ApproxDistributionMetricsModule.ProcessArgs(
                         env_params=env_params
                     ),
+                    "exact_dist": ExactDistributionMetricsModule.ProcessArgs(
+                        policy_params=policy_params, env_params=env_params
+                    ),
                     "elbo": ELBOMetricsModule.ProcessArgs(
                         policy_params=policy_params, env_params=env_params
                     ),
@@ -436,12 +440,40 @@ def run_experiment(cfg: OmegaConf) -> None:
     optimizer = optax.multi_transform(optimizer_defs, param_labels)
     opt_state = optimizer.init(initial_optax_params)
 
+    policy_static = eqx.filter(model, eqx.is_array, inverse=True)
+
+    def fwd_policy_fn(
+        fwd_rng_key: chex.PRNGKey,
+        env_obs: gfnx.TObs,
+        policy_params,  # current_policy_params are network params
+    ) -> chex.Array:
+        # Recombine the network parameters with the static parts of the model
+        current_model = eqx.combine(policy_params, policy_static)
+        policy_outputs = jax.vmap(current_model, in_axes=(0,))(env_obs)
+        return policy_outputs["forward_logits"], policy_outputs
+
+    def bwd_policy_fn(
+        bwd_rng_key: chex.PRNGKey,
+        env_obs: gfnx.TObs,
+        policy_params,  # current_policy_params are network params
+    ) -> chex.Array:
+        # Recombine the network parameters with the static parts of the model
+        current_model = eqx.combine(policy_params, policy_static)
+        policy_outputs = jax.vmap(current_model, in_axes=(0,))(env_obs)
+        return policy_outputs["backward_logits"], policy_outputs
+
     metrics_module = MultiMetricsModule(
         metrics={
             "approx_dist": ApproxDistributionMetricsModule(
                 metrics=["tv", "kl"],
                 env=env,
                 buffer_size=cfg.logging.metric_buffer_size,
+            ),
+            "exact_dist": ExactDistributionMetricsModule(
+                metrics=["tv", "kl"],
+                env=env,
+                fwd_policy_fn=fwd_policy_fn,
+                batch_size=cfg.metrics.batch_size,
             ),
             "elbo": ELBOMetricsModule(
                 env=env,
@@ -471,6 +503,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         args=metrics_module.InitArgs(
             metrics_args={
                 "approx_dist": ApproxDistributionMetricsModule.InitArgs(env_params=env_params),
+                "exact_dist": ExactDistributionMetricsModule.InitArgs(env_params=env_params),
                 "elbo": ELBOMetricsModule.InitArgs(),
                 "eubo": EUBOMetricsModule.InitArgs(),
                 "rd": SWMeanRewardSWMetricsModule.InitArgs(),
@@ -536,7 +569,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         hydra.core.hydra_config.HydraConfig.get().runtime.output_dir,
         f"checkpoints_{os.getpid()}/",
     )
-    save_checkpoint(os.path.join(dir, "train_state"), train_state)
+    save_checkpoint(os.path.join(dir, "model"), train_state.model)
 
 
 if __name__ == "__main__":

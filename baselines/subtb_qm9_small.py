@@ -1,4 +1,4 @@
-"""Single-file implementation for Detailed Balance in QM9Small environment.
+"""Single-file implementation for Sub-Trajectory Balance in QM9Small environment.
 
 Run the script with the following command:
 ```bash
@@ -108,7 +108,7 @@ class MLPPolicy(eqx.Module):
             backward_logits = jnp.zeros(shape=(self.n_bwd_actions,), dtype=jnp.float32)
         return {
             "forward_logits": forward_logits,
-            "log_flow": flow.squeeze(-1),
+            "log_flow": flow,
             "backward_logits": backward_logits,
         }
 
@@ -169,14 +169,7 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         env=train_state.env,
         env_params=train_state.env_params,
     )
-    transitions = gfnx.utils.split_traj_to_transitions(traj_data)
-    bwd_actions = train_state.env.get_backward_action(
-        transitions.state,
-        transitions.action,
-        transitions.next_state,
-        train_state.env_params,
-    )
-    # Compute the RL reward / ELBO (for logging purposes)
+
     _, log_pb_traj = gfnx.utils.forward_trajectory_log_probs(
         env, traj_data, env_params
     )
@@ -187,8 +180,8 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         current_all_params: dict,
         static_model_parts: MLPPolicy,
         current_traj_data: gfnx.utils.TrajectoryData,
-        current_env: gfnx.HypergridEnvironment,
-        current_env_params: gfnx.HypergridEnvParams,
+        current_env: gfnx.QM9SmallEnvironment,
+        current_env_params: gfnx.QM9SmallEnvParams,
     ):
         model_learnable_params = current_all_params["model_params"]
         model_to_call = eqx.combine(model_learnable_params, static_model_parts)
@@ -272,14 +265,20 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
         ).mean()
         return loss
 
-    mean_loss, grads = eqx.filter_value_and_grad(loss_fn)(train_state.model)
-    # Step 3. Update the model with grads
-    updates, opt_state = train_state.optimizer.update(
-        grads,
-        train_state.opt_state,
-        eqx.filter(train_state.model, eqx.is_array),
+    params_for_loss = {"model_params": policy_params}
+
+    mean_loss, grads = eqx.filter_value_and_grad(loss_fn)(
+        params_for_loss, policy_static, traj_data, env, env_params
     )
-    model = eqx.apply_updates(train_state.model, updates)
+
+    # Step 3. Update parameters
+    optax_params_for_update = {"model_params": policy_params}
+    updates, new_opt_state = train_state.optimizer.update(
+        grads, train_state.opt_state, optax_params_for_update
+    )
+
+    # Apply updates
+    new_model = eqx.apply_updates(train_state.model, updates["model_params"])
     # Peform all the requied logging
     rewards = jnp.exp(log_info["log_gfn_reward"])
     metrics_state = train_state.metrics_module.update(
@@ -374,8 +373,8 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
     # Return the updated train state
     return train_state._replace(
         rng_key=rng_key,
-        model=model,
-        opt_state=opt_state,
+        model=new_model,
+        opt_state=new_opt_state,
         metrics_state=metrics_state,
         eval_info=eval_info,
     )
@@ -420,9 +419,19 @@ def run_experiment(cfg: OmegaConf) -> None:
         transition_steps=cfg.agent.exploration_steps,
     )
 
-    # Initialize the optimizer
-    optimizer = optax.adam(learning_rate=cfg.agent.learning_rate)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    model_params_init = eqx.filter(model, eqx.is_array)
+    initial_optax_params = {"model_params": model_params_init}
+
+    # Define parameter labels for multi_transform
+    param_labels = {
+        "model_params": jax.tree.map(lambda _: "network_lr", model_params_init),
+    }
+
+    optimizer_defs = {
+        "network_lr": optax.adam(learning_rate=cfg.agent.learning_rate),
+    }
+    optimizer = optax.multi_transform(optimizer_defs, param_labels)
+    opt_state = optimizer.init(initial_optax_params)
 
     policy_static = eqx.filter(model, eqx.is_array, inverse=True)
 
@@ -533,7 +542,7 @@ def run_experiment(cfg: OmegaConf) -> None:
             entity=cfg.writer.entity,
             project=cfg.writer.project,
             offline_directory=cfg.writer.get("offline_directory", "./comet_offline_logs"),
-            tags=["DB", env.name.upper()],
+            tags=["SubTB", env.name.upper()],
             config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
         )
 
@@ -553,7 +562,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         hydra.core.hydra_config.HydraConfig.get().runtime.output_dir,
         f"checkpoints_{os.getpid()}/",
     )
-    save_checkpoint(os.path.join(dir, "train_state"), train_state)
+    # save_checkpoint(os.path.join(dir, "train_state"), train_state)
     save_checkpoint(os.path.join(dir, "model"), train_state.model)
 
 
