@@ -45,7 +45,9 @@ def sinkhorn_distance(x: chex.Array, y: chex.Array, reg: float = 0.05, n_iters: 
     Start with reg=0.05-0.1 to get something stable and tighten later if you need to
     match their exact numbers.
     """
-    cost = jnp.sum(jnp.abs(x[:, None, :] - y[None, :, :]), axis=-1)  # (n, m)
+    x_sum = jnp.sum(x, axis=-1)
+    y_sum = jnp.sum(y, axis=-1)
+    cost = x_sum[:, None] + y_sum[None, :] - 2.0 * (x @ y.T)  # (n, m)
     n, m = cost.shape
     log_mu = -jnp.log(n) * jnp.ones(n)
     log_nu = -jnp.log(m) * jnp.ones(m)
