@@ -66,3 +66,39 @@ class BitseqRewardModule(BaseRewardModule[BitseqEnvState, BitseqEnvParams]):
 
     def reward(self, state: BitseqEnvState, env_params: BitseqEnvParams) -> TReward:
         return jnp.exp(self.log_reward(state, env_params))
+
+class BitseqIsingRewardModule(BaseRewardModule[BitseqEnvState, BitseqEnvParams]):
+    def __init__(
+        self,
+        L: int = 16,
+        beta: float = 0.6,
+        k: int = 8,
+    ):
+        self.L = L
+        self.beta = beta
+        self.k = k
+
+    def init(self, rng_key, dummy_state):
+        return {
+            "beta": jnp.asarray(self.beta, dtype=jnp.float32),
+        }
+
+    def log_reward(self, state, env_params):
+        beta = env_params.reward_params["beta"]
+
+        def single_log_reward(tokens):
+            bits = detokenize(tokens, self.k)
+            spins = 2.0 * bits.astype(jnp.float32) - 1.0
+            spins = spins.reshape(self.L, self.L)
+
+            right = jnp.roll(spins, -1, axis=1)
+            down = jnp.roll(spins, -1, axis=0)
+
+            interaction = (jnp.sum(spins * right) + jnp.sum(spins * down))
+
+            return beta * interaction
+
+        return jax.vmap(single_log_reward)(state.tokens)
+
+    def reward(self, state, env_params):
+        return jnp.exp(self.log_reward(state, env_params))

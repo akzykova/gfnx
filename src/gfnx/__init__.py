@@ -24,6 +24,7 @@ from .environment import (
     BitseqEnvironment,
     BitseqEnvParams,
     BitseqEnvState,
+    IsingBitseqEnvironment,
     DAGEnvironment,
     DAGEnvParams,
     DAGEnvState,
@@ -48,6 +49,7 @@ from .environment import (
 )
 from .reward import (
     BitseqRewardModule,
+    BitseqIsingRewardModule,
     DAGRewardModule,
     EasyHypergridRewardModule,
     EqxProxyAMPRewardModule,
@@ -73,6 +75,9 @@ __all__ = [
     "BitseqEnvParams",
     "BitseqEnvState",
     "BitseqRewardModule",
+    "BitseqIsingRewardModule",
+    "IsingPhysicsMetricsModule",
+    "IsingBitseqEnvironment",
     "EasyHypergridRewardModule",
     "EqxProxyAMPRewardModule",
     "EqxProxyGFPRewardModule",

@@ -4,6 +4,7 @@ from .amp import EnvState as AMPEnvState
 from .bitseq import BitseqEnvironment
 from .bitseq import EnvParams as BitseqEnvParams
 from .bitseq import EnvState as BitseqEnvState
+from .ising_bitseq import IsingBitseqEnvironment
 from .dag import DAGEnvironment
 from .dag import EnvParams as DAGEnvParams
 from .dag import EnvState as DAGEnvState
@@ -33,6 +34,7 @@ __all__ = [
     "BitseqEnvironment",
     "BitseqEnvState",
     "BitseqEnvParams",
+    "IsingBitseqEnvironment",
     "DAGEnvironment",
     "DAGEnvState",
     "DAGEnvParams",

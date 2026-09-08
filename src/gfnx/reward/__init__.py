@@ -1,5 +1,6 @@
 from .amp import EqxProxyAMPRewardModule
 from .bitseq import BitseqRewardModule
+from .bitseq import BitseqIsingRewardModule
 from .dag import DAGRewardModule
 from .dag_likelihood import BGeScore, LinearGaussianScore, ZeroScore
 from .dag_prior import UniformDAGPrior
@@ -16,6 +17,7 @@ from .tfbind import TFBind8RewardModule
 
 __all__ = [
     "BitseqRewardModule",
+    "BitseqIsingRewardModule",
     "EasyHypergridRewardModule",
     "EqxProxyAMPRewardModule",
     "EqxProxyGFPRewardModule",
