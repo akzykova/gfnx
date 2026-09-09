@@ -612,6 +612,78 @@ def run_experiment(cfg: OmegaConf) -> None:
             f"checkpoints_{os.getpid()}/",
         )
     )
+
+    log.info("Running final evaluation with %d samples", cfg.metrics.n_final_gt_samples)
+
+    policy_params, _ = eqx.partition(train_state.model, eqx.is_array)
+
+    eval_init_key, final_gt_key = jax.random.split(eval_init_key)
+    final_gt_spins, _, _ = gfnx.utils.wolff_sampler(
+        key=final_gt_key,
+        N=cfg.environment.L,
+        sigma=1.0,
+        alpha=cfg.environment.beta / 2.0,
+        num_samples=cfg.metrics.n_final_gt_samples,
+        burn_in=cfg.metrics.gt_burn_in,
+        sweeps_per_sample=cfg.metrics.gt_sweeps_per_sample,
+    )
+    final_gt_bits = ((final_gt_spins + 1) // 2).reshape(cfg.metrics.n_final_gt_samples, -1).astype(jnp.int32)
+    final_gt_tokens = vector_tokenize(final_gt_bits)
+    final_gt_states = gfnx.BitseqEnvState(
+        tokens=final_gt_tokens,
+        is_terminal=jnp.ones((cfg.metrics.n_final_gt_samples,), dtype=jnp.bool),
+        is_initial=jnp.zeros((cfg.metrics.n_final_gt_samples,), dtype=jnp.bool),
+        is_pad=jnp.zeros((cfg.metrics.n_final_gt_samples,), dtype=jnp.bool),
+    )
+
+    final_metrics_module = MultiMetricsModule({
+        "correlation": TestCorrelationMetricsModule(
+            env=env, bwd_policy_fn=bwd_policy_fn,
+            n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.batch_size,
+        ),
+        "elbo": ELBOMetricsModule(
+            env=env, env_params=train_state.env_params, fwd_policy_fn=fwd_policy_fn,
+            n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.batch_size,
+        ),
+        "eubo": EUBOMetricsModule(
+            env=env, env_params=train_state.env_params, bwd_policy_fn=bwd_policy_fn,
+            n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.eubo_batch_size,
+            rng_key=eval_init_key,
+        ),
+        "physics": IsingPhysicsMetricsModule(
+            env=env, L=cfg.environment.L, k=cfg.environment.k,
+            fwd_policy_fn=fwd_policy_fn, gt_spins=final_gt_spins,
+            n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.batch_size,
+            sinkhorn_reg=cfg.metrics.sinkhorn_reg, sinkhorn_iters=cfg.metrics.sinkhorn_iters,
+        ),
+    })
+
+    eval_init_key, final_init_key = jax.random.split(eval_init_key)
+    final_metrics_state = final_metrics_module.init(
+        final_init_key,
+        final_metrics_module.InitArgs(metrics_args={
+            "correlation": TestCorrelationMetricsModule.InitArgs(
+                env_params=train_state.env_params, test_set=final_gt_states,
+            ),
+        }),
+    )
+
+    eval_init_key, final_process_key = jax.random.split(eval_init_key)
+    final_metrics_state = final_metrics_module.process(
+        metrics_state=final_metrics_state,
+        rng_key=final_process_key,
+        args=final_metrics_module.ProcessArgs(metrics_args={
+            "correlation": TestCorrelationMetricsModule.ProcessArgs(policy_params=policy_params, env_params=train_state.env_params),
+            "elbo": ELBOMetricsModule.ProcessArgs(policy_params=policy_params, env_params=train_state.env_params),
+            "eubo": EUBOMetricsModule.ProcessArgs(policy_params=policy_params, env_params=train_state.env_params),
+            "physics": IsingPhysicsMetricsModule.ProcessArgs(policy_params=policy_params, env_params=train_state.env_params),
+        }),
+    )
+    final_eval_info = {f"final/{k}": float(v) for k, v in final_metrics_module.get(final_metrics_state).items()}
+    log.info(final_eval_info)
+    if cfg.logging.use_writer:
+        writer.log(final_eval_info, step=cfg.num_train_steps)
+
     save_checkpoint(
         os.path.join(dir, "model_and_logZ"),
         {

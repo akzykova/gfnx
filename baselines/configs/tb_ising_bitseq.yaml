@@ -38,6 +38,8 @@ metrics:
   gt_sweeps_per_sample: 5
   sinkhorn_reg: 0.001
   sinkhorn_iters: 200
+  n_final_gt_samples: 16384
+  n_final_rounds: 128
 
 logging:
   track_each: 100 # in terms of total training steps, not divided by num_envs
