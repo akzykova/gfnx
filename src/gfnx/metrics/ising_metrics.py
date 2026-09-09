@@ -166,7 +166,7 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
         C_col = _corr_curve(spins, axis=2)
         corr_error = (
             jnp.sum(jnp.abs(C_row - self.C_row_true)) + jnp.sum(jnp.abs(C_col - self.C_col_true))
-        ) / (2 * self.L)
+        ) / (4 * self.L)
 
         model_bits = ((spins + 1) / 2).reshape(spins.shape[0], -1)
         gt_bits = ((self.gt_spins + 1) / 2).reshape(self.gt_spins.shape[0], -1)

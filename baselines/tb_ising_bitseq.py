@@ -456,12 +456,23 @@ def run_experiment(cfg: OmegaConf) -> None:
         "logZ": "logZ_lr",
     }
 
+    # optimizer_defs = {
+    #     "network_lr": optax.adamw(
+    #         learning_rate=cfg.agent.learning_rate,
+    #         weight_decay=cfg.agent.weight_decay
+    #     ),
+    #     "logZ_lr": optax.adam(learning_rate=cfg.agent.logZ_learning_rate),
+    # }
+
     optimizer_defs = {
-        "network_lr": optax.adamw(
-            learning_rate=cfg.agent.learning_rate,
-            weight_decay=cfg.agent.weight_decay
+        "network_lr": optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=cfg.agent.learning_rate, weight_decay=cfg.agent.weight_decay),
         ),
-        "logZ_lr": optax.adam(learning_rate=cfg.agent.logZ_learning_rate),
+        "logZ_lr": optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adam(learning_rate=cfg.agent.logZ_learning_rate),
+        ),
     }
     optimizer = optax.multi_transform(optimizer_defs, param_labels)
     opt_state = optimizer.init(initial_optax_params)
