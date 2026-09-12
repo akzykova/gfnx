@@ -14,6 +14,7 @@ agent:
   start_eps: 0.0
   end_eps: 0.0
   exploration_steps: 0 # Should be <= of num_train_steps
+  gae_lambda: 0.7
   ppo_policy_epochs: 4
   ppo_baseline_epochs: 4
   ppo_baseline_num_splits: 2
