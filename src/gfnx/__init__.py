@@ -78,6 +78,7 @@ __all__ = [
     "BitseqIsingRewardModule",
     "IsingPhysicsMetricsModule",
     "IsingBitseqEnvironment",
+    "IsingEUBOMetricsModule",
     "EasyHypergridRewardModule",
     "EqxProxyAMPRewardModule",
     "EqxProxyGFPRewardModule",

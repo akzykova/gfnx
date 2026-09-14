@@ -30,16 +30,17 @@ environment:
   k: 8
 
 metrics:
-  n_rounds: 16
-  batch_size: 128
-  eubo_batch_size: 128
-  n_gt_samples: 2048
-  gt_burn_in: 2000
-  gt_sweeps_per_sample: 5
+  n_rounds: 10
+  batch_size: 2048
+  eubo_batch_size: 2048
+
+  gt_burn_in: 1000
+  gt_sweeps_per_sample: 100
+
   sinkhorn_reg: 0.001
   sinkhorn_iters: 200
+
   n_final_gt_samples: 16384
-  n_final_rounds: 128
 
 logging:
   track_each: 100 # in terms of total training steps, not divided by num_envs

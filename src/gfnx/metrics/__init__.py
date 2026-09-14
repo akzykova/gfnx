@@ -28,7 +28,7 @@ from .reward_delta import (
     SWMeanRewardSWMetricsModule,
 )
 from .top_k import TopKMetricsModule, TopKMetricsState
-from .ising_metrics import IsingPhysicsMetricsModule
+from .ising_metrics import IsingPhysicsMetricsModule, IsingEUBOMetricsModule
 
 __all__ = [
     # Base classes
@@ -68,4 +68,5 @@ __all__ = [
     "TopKMetricsState",
     # Ising metrics
     "IsingPhysicsMetricsModule",
+    "IsingEUBOMetricsModule",
 ]

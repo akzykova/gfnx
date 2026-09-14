@@ -9,6 +9,7 @@ from .exploration import (
 from .ising import get_true_ising_J
 from .ising_hbpt_sample import pt_sampler
 from .ising_wolf_sample import wolff_sampler
+from .ising_sw_sample import swendsen_wang_sampler
 from .masking import mask_logits
 from .molecules import (
     QM9_SMALL_BLOCKS,
