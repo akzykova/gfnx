@@ -163,7 +163,6 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
         L: int,
         k: int,
         fwd_policy_fn: TPolicyFn,
-        gt_spins: chex.Array,
         n_rounds: int,
         batch_size: int,
         sinkhorn_reg: float = 1e-3,
@@ -173,17 +172,12 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
         self.L = L
         self.k = k
         self.fwd_policy_fn = fwd_policy_fn
-        self.gt_spins = gt_spins
-        self.pool_size = gt_spins.shape[0]
+
         self.n_rounds = n_rounds
         self.batch_size = batch_size
+
         self.sinkhorn_reg = sinkhorn_reg
         self.sinkhorn_iters = sinkhorn_iters
-
-        if self.batch_size > self.pool_size:
-            raise ValueError(
-                f"batch_size={self.batch_size} cannot exceed GT pool size={self.pool_size}"
-            )
 
     InitArgs = EmptyInitArgs
 
@@ -225,18 +219,38 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
     ) -> IsingPhysicsMetricState:
 
         def process_round(carry_rng_key, _):
-            rng_key, gt_key, model_key = jax.random.split(carry_rng_key, 3)
-
-            # Fresh reference subset from the fixed SW pool.
-            gt_idx = jax.random.choice(
-                gt_key,
-                self.pool_size,
-                shape=(self.batch_size,),
-                replace=False,
+            rng_key, gt_key, model_key = jax.random.split(
+                carry_rng_key,
+                3,
             )
-            gt_spins = self.gt_spins[gt_idx]
 
-            # Fresh model samples of the same size.
+            # ------------------------------------------------------------
+            # Fresh GT batch from the fixed .npz pool.
+            # get_ground_truth_sampling() returns BitseqEnvState(tokens=...).
+            # ------------------------------------------------------------
+            gt_state = self.env.get_ground_truth_sampling(
+                rng_key=gt_key,
+                batch_size=self.batch_size,
+                env_params=args.env_params,
+            )
+
+            # tokens -> bits {0,1}
+            gt_bits = jax.vmap(
+                lambda t: detokenize(t, self.k)
+            )(gt_state.tokens)
+
+            # bits {0,1} -> spins {-1,+1}
+            gt_spins = (
+                2.0 * gt_bits.astype(jnp.float32) - 1.0
+            ).reshape(
+                self.batch_size,
+                self.L,
+                self.L,
+            )
+
+            # ------------------------------------------------------------
+            # Fresh model samples.
+            # ------------------------------------------------------------
             _, aux_info = forward_rollout(
                 rng_key=model_key,
                 num_envs=self.batch_size,
@@ -246,24 +260,29 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
                 env_params=args.env_params,
             )
 
-            # final_env_state is the canonical final state returned by GFNx's
-            # forward_rollout API. It is not an ad-hoc reconstruction.
             final_state = aux_info["final_env_state"]
-            tokens = final_state.tokens
-            bits = jax.vmap(lambda t: detokenize(t, self.k))(tokens)
-            spins = (
-                2.0 * bits.astype(jnp.float32) - 1.0
-            ).reshape(self.batch_size, self.L, self.L)
+
+            model_bits = jax.vmap(
+                lambda t: detokenize(t, self.k)
+            )(final_state.tokens)
+
+            model_spins = (
+                2.0 * model_bits.astype(jnp.float32) - 1.0
+            ).reshape(
+                self.batch_size,
+                self.L,
+                self.L,
+            )
 
             # ------------------------------------------------------------
             # Magnetization error.
-            # Reference Ising2D uses zero target magnetization for h == 0.
             # ------------------------------------------------------------
-            model_mean = jnp.mean(spins, axis=0)
+            model_mean = jnp.mean(model_spins, axis=0)
+
             row_model = jnp.mean(model_mean, axis=1)
             col_model = jnp.mean(model_mean, axis=0)
 
-            # This experiment has h=0, so the reference target is zero.
+            # h = 0 -> target magnetization is zero.
             row_gt = jnp.zeros_like(row_model)
             col_gt = jnp.zeros_like(col_model)
 
@@ -274,35 +293,69 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
 
             # ------------------------------------------------------------
             # Two-point correlation error.
-            # Reference divides the combined row+column error by 4L.
             # ------------------------------------------------------------
-            row_model_corr = _corr_curve(spins, axis=1)
-            col_model_corr = _corr_curve(spins, axis=2)
-            row_gt_corr = _corr_curve(gt_spins, axis=1)
-            col_gt_corr = _corr_curve(gt_spins, axis=2)
+            row_model_corr = _corr_curve(
+                model_spins,
+                axis=1,
+            )
+            col_model_corr = _corr_curve(
+                model_spins,
+                axis=2,
+            )
+
+            row_gt_corr = _corr_curve(
+                gt_spins,
+                axis=1,
+            )
+            col_gt_corr = _corr_curve(
+                gt_spins,
+                axis=2,
+            )
 
             corr_error = (
-                jnp.sum(jnp.abs(row_model_corr - row_gt_corr))
-                + jnp.sum(jnp.abs(col_model_corr - col_gt_corr))
+                jnp.sum(
+                    jnp.abs(row_model_corr - row_gt_corr)
+                )
+                + jnp.sum(
+                    jnp.abs(col_model_corr - col_gt_corr)
+                )
             ) / (4.0 * self.L)
 
             # ------------------------------------------------------------
-            # Sinkhorn distance between the two binary sample batches.
-            # Reference uses Hamming cost and epsilon=1e-3.
+            # Sinkhorn distance.
             # ------------------------------------------------------------
-            model_bits = ((spins + 1.0) / 2.0).reshape(self.batch_size, -1)
-            gt_bits = ((gt_spins + 1.0) / 2.0).reshape(self.batch_size, -1)
+            model_bits_float = (
+                (model_spins + 1.0) / 2.0
+            ).reshape(
+                self.batch_size,
+                -1,
+            )
+
+            gt_bits_float = (
+                (gt_spins + 1.0) / 2.0
+            ).reshape(
+                self.batch_size,
+                -1,
+            )
 
             sinkhorn = sinkhorn_distance(
-                gt_bits,
-                model_bits,
+                gt_bits_float,
+                model_bits_float,
                 reg=self.sinkhorn_reg,
                 n_iters=self.sinkhorn_iters,
             )
 
-            return rng_key, (mag_error, corr_error, sinkhorn)
+            return rng_key, (
+                mag_error,
+                corr_error,
+                sinkhorn,
+            )
 
-        _, (mag_rounds, corr_rounds, sinkhorn_rounds) = jax.lax.scan(
+        _, (
+            mag_rounds,
+            corr_rounds,
+            sinkhorn_rounds,
+        ) = jax.lax.scan(
             process_round,
             rng_key,
             None,

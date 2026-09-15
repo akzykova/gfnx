@@ -1,27 +1,20 @@
+import numpy as np
 import jax
 import jax.numpy as jnp
 
 from .bitseq import BitseqEnvironment
 from .bitseq import EnvState as BitseqEnvState
 from gfnx.utils.bitseq import tokenize
-from gfnx.utils import swendsen_wang_sampler
 
 
 class IsingBitseqEnvironment(BitseqEnvironment):
-    """16x16 Ising model using the GFNx BitSeq representation.
-
-    The generative environment remains the standard BitSeq environment.
-    Swendsen-Wang is used only for generating ground-truth Ising samples.
-    """
-
     def __init__(
         self,
         reward_module,
         L: int,
         k: int,
         beta: float,
-        sw_burn_in: int = 1000,
-        sw_sweeps_per_sample: int = 100,
+        gt_samples_path: str | None = None,
     ):
         super().__init__(
             reward_module,
@@ -31,12 +24,41 @@ class IsingBitseqEnvironment(BitseqEnvironment):
 
         self.L = L
         self.beta = beta
-        self.sw_burn_in = sw_burn_in
-        self.sw_sweeps_per_sample = sw_sweeps_per_sample
+
+        self.gt_bits = None
+        self.gt_pool_size = None
+
+        if gt_samples_path is not None:
+            data = np.load(gt_samples_path)
+
+            bits = data["bits"].astype(np.int32)
+            file_L = int(data["L"])
+            file_beta = float(data["beta"])
+
+            if file_L != L:
+                raise ValueError(
+                    f"GT file has L={file_L}, but environment has L={L}"
+                )
+
+            if not np.isclose(file_beta, beta):
+                raise ValueError(
+                    f"GT file has beta={file_beta}, but environment has beta={beta}"
+                )
+
+            if bits.ndim != 2 or bits.shape[1] != L * L:
+                raise ValueError(
+                    f"Expected GT bits shape (N, {L * L}), got {bits.shape}"
+                )
+
+            if not np.all((bits == 0) | (bits == 1)):
+                raise ValueError("GT samples must contain only 0/1 bits")
+
+            self.gt_bits = jnp.asarray(bits, dtype=jnp.int32)
+            self.gt_pool_size = bits.shape[0]
 
     @property
     def is_ground_truth_sampling_tractable(self) -> bool:
-        return True
+        return self.gt_bits is not None
 
     def get_ground_truth_sampling(
         self,
@@ -44,31 +66,37 @@ class IsingBitseqEnvironment(BitseqEnvironment):
         batch_size,
         env_params,
     ):
-        """Generate equilibrium Ising samples using Swendsen-Wang."""
+        """Sample a fresh batch from the fixed reference GT pool."""
 
-        gt_spins, _, _ = swendsen_wang_sampler(
-            key=rng_key,
-            L=self.L,
-            beta=self.beta,
-            J=1.0,
-            num_samples=batch_size,
-            batch_size=256,
-            burn_in=self.sw_burn_in,
-            collect_every=self.sw_sweeps_per_sample,
+        if self.gt_bits is None:
+            raise RuntimeError(
+                "gt_samples_path was not provided, so ground-truth "
+                "sampling is unavailable."
+            )
+
+        if batch_size > self.gt_pool_size:
+            raise ValueError(
+                f"batch_size={batch_size} cannot exceed "
+                f"GT pool size={self.gt_pool_size}"
+            )
+
+        # Fresh random subset every call.
+        indices = jax.random.choice(
+            rng_key,
+            self.gt_pool_size,
+            shape=(batch_size,),
+            replace=False,
         )
 
-        # {-1,+1} -> {0,1}
-        gt_bits = (
-            (gt_spins + 1) // 2
-        ).reshape(batch_size, -1).astype(jnp.int32)
+        bits = self.gt_bits[indices]
 
-        # Pack 8 bits -> one BitSeq token.
-        gt_tokens = jax.vmap(
-            lambda bits: tokenize(bits, self.k)
-        )(gt_bits)
+        # {0,1} bits -> bitseq tokens expected by BitseqEnvState.
+        tokens = jax.vmap(
+            lambda x: tokenize(x, self.k)
+        )(bits)
 
         return BitseqEnvState(
-            tokens=gt_tokens,
+            tokens=tokens,
             is_terminal=jnp.ones(
                 (batch_size,),
                 dtype=jnp.bool_,
