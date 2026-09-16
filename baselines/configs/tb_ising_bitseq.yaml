@@ -2,32 +2,32 @@ seed: 111
 env_init_seed: 1
 eval_init_seed: 2
 
-num_train_steps: 20000
-num_envs: 128
+num_train_steps: 1000000
+num_envs: 16
 
 agent:
-  learning_rate: 1e-3
-  logZ_learning_rate: 1e-1
-  weight_decay: 0.0
-  start_eps: 0.0
-  end_eps: 0.0
-  exploration_steps: 0 # Should be <= of num_train_steps
+  learning_rate: 5e-5
+  logZ_learning_rate: 5e-2
+  weight_decay: 1e-5
+  start_eps: 0.1
+  end_eps: 0.1
+  exploration_steps: 100000 # Should be <= of num_train_steps
   train_backward: false
   anneal_beta: true
 
 network:
-  num_heads: 4
-  num_layers: 2
-  embedding_size: 64
-  hidden_size: 64
-  intermediate_size: 64
+  num_heads: 8
+  num_layers: 3
+  embedding_size: 136
+  hidden_size: 136
+  intermediate_size: 136
   dropout_rate: 0.0
   attention_dropout_rate: 0.0
 
 environment:
   L: 16
-  beta: 0.6
-  k: 8
+  beta: 0.4407
+  k: 4
 
 metrics:
   n_rounds: 10
