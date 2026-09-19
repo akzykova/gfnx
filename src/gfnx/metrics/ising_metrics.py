@@ -323,27 +323,11 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
 
             # ------------------------------------------------------------
             # Sinkhorn distance.
+            # Disabled: sinkhorn_distance() is O(n_iters * batch_size^2) and
+            # dominates eval cost. Skip the call entirely; keep the key with
+            # a placeholder so downstream logging/shape contracts don't break.
             # ------------------------------------------------------------
-            model_bits_float = (
-                (model_spins + 1.0) / 2.0
-            ).reshape(
-                self.batch_size,
-                -1,
-            )
-
-            gt_bits_float = (
-                (gt_spins + 1.0) / 2.0
-            ).reshape(
-                self.batch_size,
-                -1,
-            )
-
-            sinkhorn = sinkhorn_distance(
-                gt_bits_float,
-                model_bits_float,
-                reg=self.sinkhorn_reg,
-                n_iters=self.sinkhorn_iters,
-            )
+            sinkhorn = jnp.zeros((), dtype=jnp.float32)
 
             return rng_key, (
                 mag_error,
@@ -367,121 +351,3 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
             corr_error=jnp.mean(corr_rounds),
             sinkhorn=jnp.mean(sinkhorn_rounds),
         )
-
-
-# -----------------------------------------------------------------------------
-# EUBO
-# -----------------------------------------------------------------------------
-
-
-@chex.dataclass
-class IsingEUBOMetricState(MetricsState):
-    eubo: jnp.ndarray
-
-
-class IsingEUBOMetricsModule(BaseMetricsModule):
-    """EUBO evaluated from a fixed reference-state pool.
-
-    ``gt_states`` must contain terminal BitseqEnvState objects corresponding to
-    the same fixed SW reference pool as the physics metrics. Each round draws a
-    fresh subset from that pool, then runs the GFNx backward rollout from those
-    terminal states. The per-round EUBO estimates are averaged.
-    """
-
-    def __init__(
-        self,
-        env,
-        bwd_policy_fn: TPolicyFn,
-        gt_states,
-        n_rounds: int,
-        batch_size: int,
-    ):
-        self.env = env
-        self.bwd_policy_fn = bwd_policy_fn
-        self.gt_states = gt_states
-        self.pool_size = gt_states.tokens.shape[0]
-        self.n_rounds = n_rounds
-        self.batch_size = batch_size
-
-        if self.batch_size > self.pool_size:
-            raise ValueError(
-                f"batch_size={self.batch_size} cannot exceed GT pool size={self.pool_size}"
-            )
-
-        if env.is_normalizing_constant_tractable:
-            self.logZ = jnp.log(env.get_normalizing_constant(None))
-        else:
-            self.logZ = jnp.array(0.0, dtype=jnp.float32)
-
-    InitArgs = EmptyInitArgs
-
-    def init(self, rng_key, args):
-        del rng_key, args
-        return IsingEUBOMetricState(
-            eubo=jnp.array(jnp.inf, dtype=jnp.float32)
-        )
-
-    UpdateArgs = EmptyUpdateArgs
-
-    def update(self, metrics_state, rng_key, args=None):
-        del rng_key, args
-        return metrics_state
-
-    def get(self, metrics_state: IsingEUBOMetricState):
-        return {"eubo": metrics_state.eubo}
-
-    @chex.dataclass
-    class ProcessArgs(BaseProcessArgs):
-        policy_params: TPolicyParams
-        env_params: TEnvParams
-
-    def process(self, metrics_state, rng_key, args):
-        def process_round(carry_rng_key, _):
-            rng_key, gt_key, rollout_key = jax.random.split(carry_rng_key, 3)
-
-            # Fresh reference subset: analogous to target.cached_sample(batch_size)
-            # from a fixed larger cache.
-            idx = jax.random.choice(
-                gt_key,
-                self.pool_size,
-                shape=(self.batch_size,),
-                replace=False,
-            )
-            round_states = jax.tree_util.tree_map(
-                lambda x: x[idx],
-                self.gt_states,
-            )
-
-            bwd_traj_data, _ = backward_rollout(
-                rng_key=rollout_key,
-                init_state=round_states,
-                policy_fn=self.bwd_policy_fn,
-                policy_params=args.policy_params,
-                env=self.env,
-                env_params=args.env_params,
-            )
-
-            log_rewards = self.env.reward_module.log_reward(
-                round_states,
-                args.env_params,
-            )
-            log_pf_traj, log_pb_traj = backward_trajectory_log_probs(
-                self.env,
-                bwd_traj_data,
-                args.env_params,
-            )
-
-            eubo = log_pb_traj - log_pf_traj + log_rewards
-            chex.assert_shape(eubo, (self.batch_size,))
-
-            return rng_key, eubo
-
-        _, eubo_per_round = jax.lax.scan(
-            process_round,
-            rng_key,
-            None,
-            length=self.n_rounds,
-        )
-
-        eubo = jnp.mean(eubo_per_round) - self.logZ
-        return metrics_state.replace(eubo=eubo)

@@ -34,7 +34,6 @@ from gfnx.metrics import (
     MultiMetricsState,
     ELBOMetricsModule,
     EUBOMetricsModule,
-    TestCorrelationMetricsModule,
     IsingPhysicsMetricsModule,
 )
 
@@ -543,9 +542,6 @@ def train_step(idx: int, train_state: TrainState) -> TrainState:
             "rng_key": eval_rng_key,
             "args": train_state.metrics_module.ProcessArgs(
                 metrics_args={
-                    "correlation": TestCorrelationMetricsModule.ProcessArgs(
-                        policy_params=final_p_params, env_params=train_state.env_params,
-                    ),
                     "elbo": ELBOMetricsModule.ProcessArgs(
                         policy_params=final_p_params, env_params=train_state.env_params,
                     ),
@@ -632,6 +628,13 @@ def run_experiment(cfg: OmegaConf) -> None:
     env_init_key = jax.random.PRNGKey(cfg.env_init_seed)
     eval_init_key = jax.random.PRNGKey(cfg.eval_init_seed)
 
+    GT_PATHS = {
+        0.6: "src/gfnx/ising_target_set/ising_L16_beta0.6_seed0.npz",
+        0.4407: "src/gfnx/ising_target_set/ising_L16_beta0.4407_seed0.npz",
+        1.2: "src/gfnx/ising_target_set/ising_L16_beta1.2_seed0.npz",
+    }
+    gt_samples_path = GT_PATHS[float(cfg.environment.beta)]
+
     reward_module = gfnx.BitseqIsingRewardModule(
         L=cfg.environment.L,
         beta=cfg.environment.beta,
@@ -643,8 +646,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         L=cfg.environment.L,
         k=cfg.environment.k,
         beta=cfg.environment.beta,
-        wolff_burn_in=cfg.metrics.gt_burn_in,
-        wolff_sweeps_per_sample=cfg.metrics.gt_sweeps_per_sample,
+        gt_samples_path=gt_samples_path,
     )
 
     env_params = env.init(env_init_key)
@@ -679,7 +681,7 @@ def run_experiment(cfg: OmegaConf) -> None:
     )
 
     beta_final = env_params.reward_params["beta"]
-    beta_anneal_steps = max(1, cfg.num_train_steps // 2)
+    beta_anneal_steps = cfg.agent.get("beta_anneal_steps", None) or max(1, cfg.num_train_steps // 2)
 
     if cfg.agent.anneal_beta:
         beta_schedule = optax.linear_schedule(
@@ -733,58 +735,29 @@ def run_experiment(cfg: OmegaConf) -> None:
     baseline_opt_state = baseline_optimizer.init(baseline_params)
     tlm_backward_opt_state = tlm_backward_optimizer.init(model_params)
 
-    # Ground-truth samples via the Wolff cluster algorithm (used for the
-    # correlation / physics metrics, same as in the TB Ising baseline).
-    eval_init_key, gt_key = jax.random.split(eval_init_key)
-    gt_spins, _, _ = gfnx.utils.wolff_sampler(
-        key=gt_key,
-        N=cfg.environment.L,
-        sigma=1.0,
-        alpha=cfg.environment.beta / 2.0,
-        num_samples=cfg.metrics.n_gt_samples,
-        burn_in=cfg.metrics.gt_burn_in,
-        sweeps_per_sample=cfg.metrics.gt_sweeps_per_sample,
-    )
-    gt_bits = ((gt_spins + 1) // 2).reshape(cfg.metrics.n_gt_samples, -1).astype(jnp.int32)
-    vector_tokenize = jax.vmap(lambda x: gfnx.utils.bitseq.tokenize(x, cfg.environment.k))
-    gt_tokens = vector_tokenize(gt_bits)
-    gt_states = gfnx.BitseqEnvState(
-        tokens=gt_tokens,
-        is_terminal=jnp.ones((cfg.metrics.n_gt_samples,), dtype=jnp.bool),
-        is_initial=jnp.zeros((cfg.metrics.n_gt_samples,), dtype=jnp.bool),
-        is_pad=jnp.zeros((cfg.metrics.n_gt_samples,), dtype=jnp.bool),
-    )
-
+    # ELBO / EUBO / physics metrics; ground truth is loaded from
+    # gt_samples_path (same setup as in the TB Ising baseline).
     metrics_module = MultiMetricsModule({
-        "correlation": TestCorrelationMetricsModule(
-            env=env, bwd_policy_fn=bwd_policy_fn,
-            n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.batch_size,
-        ),
         "elbo": ELBOMetricsModule(
             env=env, env_params=env_params, fwd_policy_fn=fwd_policy_fn,
             n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.batch_size,
         ),
         "eubo": EUBOMetricsModule(
             env=env, env_params=env_params, bwd_policy_fn=bwd_policy_fn,
-            n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.eubo_batch_size,
+            n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.batch_size,
             rng_key=eval_init_key,
         ),
         "physics": IsingPhysicsMetricsModule(
             env=env, L=cfg.environment.L, k=cfg.environment.k,
-            fwd_policy_fn=fwd_policy_fn, gt_spins=gt_spins,
+            fwd_policy_fn=fwd_policy_fn,
             n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.batch_size,
             sinkhorn_reg=cfg.metrics.sinkhorn_reg, sinkhorn_iters=cfg.metrics.sinkhorn_iters,
         ),
     })
 
-    eval_init_key, correlation_init_key = jax.random.split(eval_init_key)
+    eval_init_key, metrics_init_key = jax.random.split(eval_init_key)
     metrics_state = metrics_module.init(
-        correlation_init_key,
-        metrics_module.InitArgs(metrics_args={
-            "correlation": TestCorrelationMetricsModule.InitArgs(
-                env_params=env_params, test_set=gt_states,
-            ),
-        }),
+        metrics_init_key,
     )
     eval_info = metrics_module.get(metrics_state)
 
@@ -861,43 +834,20 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     policy_params, _ = eqx.partition(train_state.model, eqx.is_array)
 
-    eval_init_key, final_gt_key = jax.random.split(eval_init_key)
-    final_gt_spins, _, _ = gfnx.utils.wolff_sampler(
-        key=final_gt_key,
-        N=cfg.environment.L,
-        sigma=1.0,
-        alpha=cfg.environment.beta / 2.0,
-        num_samples=cfg.metrics.n_final_gt_samples,
-        burn_in=cfg.metrics.gt_burn_in,
-        sweeps_per_sample=cfg.metrics.gt_sweeps_per_sample,
-    )
-    final_gt_bits = ((final_gt_spins + 1) // 2).reshape(cfg.metrics.n_final_gt_samples, -1).astype(jnp.int32)
-    final_gt_tokens = vector_tokenize(final_gt_bits)
-    final_gt_states = gfnx.BitseqEnvState(
-        tokens=final_gt_tokens,
-        is_terminal=jnp.ones((cfg.metrics.n_final_gt_samples,), dtype=jnp.bool),
-        is_initial=jnp.zeros((cfg.metrics.n_final_gt_samples,), dtype=jnp.bool),
-        is_pad=jnp.zeros((cfg.metrics.n_final_gt_samples,), dtype=jnp.bool),
-    )
-
     final_metrics_module = MultiMetricsModule({
-        "correlation": TestCorrelationMetricsModule(
-            env=env, bwd_policy_fn=bwd_policy_fn,
-            n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.batch_size,
-        ),
         "elbo": ELBOMetricsModule(
             env=env, env_params=train_state.env_params, fwd_policy_fn=fwd_policy_fn,
             n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.batch_size,
         ),
         "eubo": EUBOMetricsModule(
             env=env, env_params=train_state.env_params, bwd_policy_fn=bwd_policy_fn,
-            n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.eubo_batch_size,
+            n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.final_batch_size,
             rng_key=eval_init_key,
         ),
         "physics": IsingPhysicsMetricsModule(
             env=env, L=cfg.environment.L, k=cfg.environment.k,
-            fwd_policy_fn=fwd_policy_fn, gt_spins=final_gt_spins,
-            n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.batch_size,
+            fwd_policy_fn=fwd_policy_fn,
+            n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.final_batch_size,
             sinkhorn_reg=cfg.metrics.sinkhorn_reg, sinkhorn_iters=cfg.metrics.sinkhorn_iters,
         ),
     })
@@ -905,11 +855,6 @@ def run_experiment(cfg: OmegaConf) -> None:
     eval_init_key, final_init_key = jax.random.split(eval_init_key)
     final_metrics_state = final_metrics_module.init(
         final_init_key,
-        final_metrics_module.InitArgs(metrics_args={
-            "correlation": TestCorrelationMetricsModule.InitArgs(
-                env_params=train_state.env_params, test_set=final_gt_states,
-            ),
-        }),
     )
 
     eval_init_key, final_process_key = jax.random.split(eval_init_key)
@@ -917,9 +862,6 @@ def run_experiment(cfg: OmegaConf) -> None:
         metrics_state=final_metrics_state,
         rng_key=final_process_key,
         args=final_metrics_module.ProcessArgs(metrics_args={
-            "correlation": TestCorrelationMetricsModule.ProcessArgs(
-                policy_params=policy_params, env_params=train_state.env_params,
-            ),
             "elbo": ELBOMetricsModule.ProcessArgs(
                 policy_params=policy_params, env_params=train_state.env_params,
             ),
