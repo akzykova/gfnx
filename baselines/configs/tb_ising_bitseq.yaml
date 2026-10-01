@@ -2,52 +2,55 @@ seed: 111
 env_init_seed: 1
 eval_init_seed: 2
 
-num_train_steps: 1000000
-num_envs: 16
+num_train_steps: 200000
+num_envs: 256
 
 agent:
-  learning_rate: 5e-5
+  learning_rate: 0.0005
   logZ_learning_rate: 5e-2
   weight_decay: 1e-5
-  start_eps: 0.1
-  end_eps: 0.1
-  exploration_steps: 100000 # Should be <= of num_train_steps
+  start_eps: 0.0
+  end_eps: 0.0
+  exploration_steps: 0 # Should be <= of num_train_steps
   train_backward: false
   anneal_beta: true
+  beta_anneal_steps: 50000
 
 network:
-  num_heads: 8
+  num_heads: 4
   num_layers: 3
-  embedding_size: 136
-  hidden_size: 136
-  intermediate_size: 136
+  embedding_size: 64
+  hidden_size: 64
+  intermediate_size: 64
   dropout_rate: 0.0
   attention_dropout_rate: 0.0
 
 environment:
   L: 16
   beta: 0.4407
-  k: 4
-
+  k: 8
+ 
 metrics:
   n_rounds: 10
   batch_size: 2048
   final_batch_size: 16384
-
+ 
   sinkhorn_reg: 0.001
   sinkhorn_iters: 200
+  compute_sinkhorn: true
+  sinkhorn_chunk_size: 1024  # must divide batch_size and final_batch_size; keeps memory O(chunk*batch)
 
 logging:
-  track_each: 100 # in terms of total training steps, not divided by num_envs
-  eval_each: 500 # in terms of total training steps, not divided by num_envs
+  track_each: 1000 # in terms of total training steps, not divided by num_envs
+  eval_each: 1000 # in terms of total training steps, not divided by num_envs
   metric_buffer_size: 200000
-  tqdm_print_rate: 100
+  tqdm_print_rate: 500
   use_writer: true
   log_dir: null # If null, dir will be automatically created
   checkpoint_dir: null # If null, dir will be automatically created
 # Technical information for writer
 writer:
-  writer_type: comet_ml # wandb, trackio or null (no logging online)
+  writer_type: null # wandb, trackio or null (no logging online)
   save_locally: false # Save metrics locally or not
   entity: azykova-myzina
   project: ising

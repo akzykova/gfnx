@@ -752,6 +752,8 @@ def run_experiment(cfg: OmegaConf) -> None:
             fwd_policy_fn=fwd_policy_fn,
             n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.batch_size,
             sinkhorn_reg=cfg.metrics.sinkhorn_reg, sinkhorn_iters=cfg.metrics.sinkhorn_iters,
+            compute_sinkhorn=cfg.metrics.get("compute_sinkhorn", True),
+            sinkhorn_chunk_size=cfg.metrics.get("sinkhorn_chunk_size", None),
         ),
     })
 
@@ -830,14 +832,17 @@ def run_experiment(cfg: OmegaConf) -> None:
         )
     )
 
-    log.info("Running final evaluation with %d samples", cfg.metrics.n_final_gt_samples)
+    log.info(
+        "Running final evaluation: %d rounds x %d samples",
+        cfg.metrics.n_rounds, cfg.metrics.final_batch_size,
+    )
 
     policy_params, _ = eqx.partition(train_state.model, eqx.is_array)
 
     final_metrics_module = MultiMetricsModule({
         "elbo": ELBOMetricsModule(
             env=env, env_params=train_state.env_params, fwd_policy_fn=fwd_policy_fn,
-            n_rounds=cfg.metrics.n_final_rounds, batch_size=cfg.metrics.batch_size,
+            n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.final_batch_size,
         ),
         "eubo": EUBOMetricsModule(
             env=env, env_params=train_state.env_params, bwd_policy_fn=bwd_policy_fn,
@@ -849,6 +854,8 @@ def run_experiment(cfg: OmegaConf) -> None:
             fwd_policy_fn=fwd_policy_fn,
             n_rounds=cfg.metrics.n_rounds, batch_size=cfg.metrics.final_batch_size,
             sinkhorn_reg=cfg.metrics.sinkhorn_reg, sinkhorn_iters=cfg.metrics.sinkhorn_iters,
+            compute_sinkhorn=cfg.metrics.get("compute_sinkhorn", True),
+            sinkhorn_chunk_size=cfg.metrics.get("sinkhorn_chunk_size", None),
         ),
     })
 

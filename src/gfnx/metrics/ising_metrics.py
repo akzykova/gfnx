@@ -74,62 +74,111 @@ def _corr_curve(spins: chex.Array, axis: int) -> chex.Array:
     return jnp.stack([at_shift(r) for r in range(L)])
 
 
+def _hamming_block(x_blk: chex.Array, y: chex.Array) -> chex.Array:
+    """Pairwise Hamming distances between rows of binary arrays.
+
+    For x, y in {0, 1}^d:  |x - y|_1 = sum(x) + sum(y) - 2 <x, y>.
+    """
+    inner = jnp.matmul(x_blk, y.T, precision=jax.lax.Precision.HIGHEST)
+    return jnp.sum(x_blk, axis=-1)[:, None] + jnp.sum(y, axis=-1)[None, :] - 2.0 * inner
+
+
 def sinkhorn_distance(
     x: chex.Array,
     y: chex.Array,
     reg: float = 1e-3,
     n_iters: int = 100,
+    chunk_size: int | None = None,
 ) -> chex.Array:
-    """Entropy-regularized OT distance with Hamming ground cost.
+    """Entropy-regularised OT cost with Hamming ground cost.
 
-    This implements the same uniform empirical measures and Hamming cost as
-    the reference ``eval_metrics.sinkhorn_distance``. Inputs are binary
-    vectors of shape (n, d) and (m, d).
+    Mirrors the reference ``eval_metrics.sinkhorn_distance`` (PyTorch): uniform
+    empirical weights on both sample sets, log-domain Sinkhorn iterations with
+    ``n_iters`` (f, g) updates, and the returned value is the *transport cost*
+    ``<P, C>`` of the final plan (not the regularised objective).
 
-    The implementation is intentionally written in log-domain form for
-    numerical stability. It is intended for the per-round subsets used by
-    ``IsingPhysicsMetricsModule``; do not call it on very large 16384 x 16384
-    sets unless the batch is chunked externally.
+    Args:
+        x: (n, d) binary array (values in {0, 1}), e.g. model samples.
+        y: (m, d) binary array (values in {0, 1}), e.g. target samples.
+            NOTE: inputs must be bits, not {-1, +1} spins; the Hamming cost
+            is computed as sum(x) + sum(y) - 2 <x, y>.
+        reg: Entropic regularisation (epsilon). The paper uses 1e-3.
+        n_iters: Number of Sinkhorn iterations. The reference uses 100.
+        chunk_size: If None, the full (n, m) cost matrix is materialised
+            (fine for the 2048-sized per-round subsets). If set, the cost is
+            recomputed block by block and never stored, so memory is
+            O(chunk_size * max(n, m)); use this for 16384 x 16384. Must divide
+            both n and m.
+
+    Returns:
+        Scalar array with the transport cost.
     """
     x = x.astype(jnp.float32)
     y = y.astype(jnp.float32)
+    n, m = x.shape[0], y.shape[0]
+    log_mu = -jnp.log(jnp.asarray(n, dtype=jnp.float32))
+    log_nu = -jnp.log(jnp.asarray(m, dtype=jnp.float32))
 
-    x_sum = jnp.sum(x, axis=-1)
-    y_sum = jnp.sum(y, axis=-1)
-    cost = x_sum[:, None] + y_sum[None, :] - 2.0 * (x @ y.T)
+    if chunk_size is None:
+        cost = _hamming_block(x, y)
 
-    n = cost.shape[0]
-    m = cost.shape[1]
-    log_mu = -jnp.log(jnp.asarray(n, dtype=cost.dtype))
-    log_nu = -jnp.log(jnp.asarray(m, dtype=cost.dtype))
+        def rows_lse(g):  # (n,)  logsumexp_j (g_j - C_ij) / reg
+            return jax.scipy.special.logsumexp((g[None, :] - cost) / reg, axis=1)
+
+        def cols_lse(f):  # (m,)  logsumexp_i (f_i - C_ij) / reg
+            return jax.scipy.special.logsumexp((f[:, None] - cost) / reg, axis=0)
+
+        def final_cost(f, g):
+            plan = jnp.exp((f[:, None] + g[None, :] - cost) / reg)
+            return jnp.sum(plan * cost)
+
+    else:
+        if n % chunk_size != 0 or m % chunk_size != 0:
+            raise ValueError(
+                f"chunk_size={chunk_size} must divide both n={n} and m={m}"
+            )
+        d = x.shape[1]
+        x_ch = x.reshape(n // chunk_size, chunk_size, d)
+        y_ch = y.reshape(m // chunk_size, chunk_size, d)
+
+        def rows_lse(g):
+            def one(x_blk):
+                c = _hamming_block(x_blk, y)  # (chunk, m)
+                return jax.scipy.special.logsumexp((g[None, :] - c) / reg, axis=1)
+
+            return jax.lax.map(one, x_ch).reshape(-1)
+
+        def cols_lse(f):
+            def one(y_blk):
+                c = _hamming_block(y_blk, x)  # (chunk, n) = C[:, block].T
+                return jax.scipy.special.logsumexp((f[None, :] - c) / reg, axis=1)
+
+            return jax.lax.map(one, y_ch).reshape(-1)
+
+        def final_cost(f, g):
+            f_ch = f.reshape(n // chunk_size, chunk_size)
+
+            def one(args):
+                x_blk, f_blk = args
+                c = _hamming_block(x_blk, y)
+                plan = jnp.exp((f_blk[:, None] + g[None, :] - c) / reg)
+                return jnp.sum(plan * c)
+
+            return jnp.sum(jax.lax.map(one, (x_ch, f_ch)))
 
     def body(_, carry):
-        f, g = carry
-        f = reg * (
-            log_mu
-            - jax.scipy.special.logsumexp(
-                (g[None, :] - cost) / reg,
-                axis=1,
-            )
-        )
-        g = reg * (
-            log_nu
-            - jax.scipy.special.logsumexp(
-                (f[:, None] - cost) / reg,
-                axis=0,
-            )
-        )
+        _, g = carry
+        f = reg * (log_mu - rows_lse(g))
+        g = reg * (log_nu - cols_lse(f))
         return f, g
 
     f, g = jax.lax.fori_loop(
         0,
         n_iters,
         body,
-        (jnp.zeros(n, dtype=cost.dtype), jnp.zeros(m, dtype=cost.dtype)),
+        (jnp.zeros(n, dtype=jnp.float32), jnp.zeros(m, dtype=jnp.float32)),
     )
-
-    plan = jnp.exp((f[:, None] + g[None, :] - cost) / reg)
-    return jnp.sum(plan * cost)
+    return final_cost(f, g)
 
 
 # -----------------------------------------------------------------------------
@@ -167,6 +216,8 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
         batch_size: int,
         sinkhorn_reg: float = 1e-3,
         sinkhorn_iters: int = 100,
+        compute_sinkhorn: bool = True,
+        sinkhorn_chunk_size: int | None = None,
     ):
         self.env = env
         self.L = L
@@ -178,6 +229,8 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
 
         self.sinkhorn_reg = sinkhorn_reg
         self.sinkhorn_iters = sinkhorn_iters
+        self.compute_sinkhorn = compute_sinkhorn
+        self.sinkhorn_chunk_size = sinkhorn_chunk_size
 
     InitArgs = EmptyInitArgs
 
@@ -322,12 +375,23 @@ class IsingPhysicsMetricsModule(BaseMetricsModule):
             ) / (4.0 * self.L)
 
             # ------------------------------------------------------------
-            # Sinkhorn distance.
-            # Disabled: sinkhorn_distance() is O(n_iters * batch_size^2) and
-            # dominates eval cost. Skip the call entirely; keep the key with
-            # a placeholder so downstream logging/shape contracts don't break.
+            # Sinkhorn distance (Hamming cost, uniform weights) between the
+            # model batch and the GT batch, on bits {0, 1}.
+            # Cost is O(n_iters * batch_size^2 * L^2); pass
+            # sinkhorn_chunk_size for large batches (e.g. 16384) to avoid
+            # materialising the full cost matrix, or compute_sinkhorn=False
+            # to skip it (the key is kept with a zero placeholder).
             # ------------------------------------------------------------
-            sinkhorn = jnp.zeros((), dtype=jnp.float32)
+            if self.compute_sinkhorn:
+                sinkhorn = sinkhorn_distance(
+                    model_bits.astype(jnp.float32),
+                    gt_bits.astype(jnp.float32),
+                    reg=self.sinkhorn_reg,
+                    n_iters=self.sinkhorn_iters,
+                    chunk_size=self.sinkhorn_chunk_size,
+                )
+            else:
+                sinkhorn = jnp.zeros((), dtype=jnp.float32)
 
             return rng_key, (
                 mag_error,
