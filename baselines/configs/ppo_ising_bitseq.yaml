@@ -13,14 +13,14 @@ agent:
   start_eps: 0.0
   end_eps: 0.0
   exploration_steps: 0 # Should be <= of num_train_steps
-  gae_lambda: 0.95
+  gae_lambda: 0.9
   ppo_policy_epochs: 1
   ppo_baseline_epochs: 4
   ppo_baseline_num_splits: 8
   tlm_epochs: 4
-  clip_eps: 0.2
+  clip_eps: 0.05
   train_backward: false
-  anneal_beta: false
+  anneal_beta: true
   beta_anneal_steps: 40000
 
 network:
@@ -48,8 +48,8 @@ metrics:
   sinkhorn_chunk_size: 1024  # must divide batch_size and final_batch_size; keeps memory O(chunk*batch)
 
 logging:
-  track_each: 100 # in terms of total training steps, not divided by num_envs
-  eval_each: 100 # in terms of total training steps, not divided by num_envs
+  track_each: 1000 # in terms of total training steps, not divided by num_envs
+  eval_each: 1000 # in terms of total training steps, not divided by num_envs
   metric_buffer_size: 200000
   tqdm_print_rate: 500
   use_writer: true
